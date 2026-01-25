@@ -1,0 +1,49 @@
+# Gerber to G-code Converter Configuration
+# Tool presets for different PCB milling operations
+
+# General settings
+general:
+  safe_height: 2.0        # mm - Z height for rapid moves
+  dpi: 1000               # Resolution for Gerber rendering
+
+# Tool presets for each operation type
+tools:
+  # Isolation routing for copper traces
+  isolation:
+    tool_diameter: 0.1    # mm - V-bit tip or engraving bit
+    spindle_speed: 10000  # RPM
+    feed_rate: 200        # mm/min - cutting feed
+    plunge_rate: 50       # mm/min - plunge feed
+    cut_depth: 0.03       # mm - depth per pass
+    passes: 1             # number of isolation passes
+    step_over: 0.1        # mm - step between passes
+
+  # Edge cuts / board outline
+  edge_cuts:
+    tool_diameter: 3.175    # mm - end mill for cutting through
+    spindle_speed: 8000   # RPM
+    feed_rate: 150        # mm/min - cutting feed
+    plunge_rate: 30       # mm/min - plunge feed
+    cut_depth: 0.3        # mm - depth per pass
+    total_depth: 1.5      # mm - total board thickness
+    tabs: false           # whether to leave holding tabs
+    tab_width: 2.0        # mm - width of tabs if enabled
+    tab_height: 0.3       # mm - height of tabs
+
+  # Drilling holes
+  drill:
+    tool_diameter: 1.2    # mm - drill bit diameter (or use peck drilling)
+    spindle_speed: 10000  # RPM
+    feed_rate: 100        # mm/min - not used for drilling
+    plunge_rate: 60       # mm/min - drilling feed
+    cut_depth: 0.3       # mm - peck depth (0 for single plunge)
+    total_depth: 1.54      # mm - drill through depth
+    retract_height: 1.0   # mm - retract between pecks
+
+# Edge cuts imputation settings (when no edge cuts file provided)
+edge_margin: 1.0          # mm - margin around traces for imputed board outline
+
+# Output options
+output:
+  separate_files: false   # true = one file per operation, false = combined
+  file_prefix: "pcb"      # prefix for output files when separate_files is true

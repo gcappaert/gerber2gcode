@@ -2,14 +2,21 @@
 """
 Gerber to G-code converter for PCB milling
 Converts Gerber files to GRBL-compatible G-code for CNC milling
+Supports separate tools for isolation routing, edge cuts, and drilling
 """
 
 import argparse
 import sys
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
 import re
+
+try:
+    import yaml
+except ImportError:
+    print("Error: PyYAML not found. Install with: pip install pyyaml")
+    sys.exit(1)
 
 try:
     from pygerber.gerberx3.api.v2 import (
@@ -30,40 +37,114 @@ except ImportError:
     sys.exit(1)
 
 
+class ToolPreset:
+    """Tool settings for a specific operation"""
+    def __init__(self, config: Dict):
+        self.tool_diameter = config.get('tool_diameter', 0.1)
+        self.spindle_speed = config.get('spindle_speed', 10000)
+        self.feed_rate = config.get('feed_rate', 200)
+        self.plunge_rate = config.get('plunge_rate', 50)
+        self.cut_depth = config.get('cut_depth', 0.1)
+        self.total_depth = config.get('total_depth', self.cut_depth)
+        self.passes = config.get('passes', 1)
+        self.step_over = config.get('step_over', 0.1)
+        self.retract_height = config.get('retract_height', 1.0)
+        self.tabs = config.get('tabs', False)
+        self.tab_width = config.get('tab_width', 2.0)
+        self.tab_height = config.get('tab_height', 0.3)
+
+
 class GerberToGcode:
-    def __init__(self, args):
-        self.input_file = args.input
-        self.output_file = args.output
-        self.tool_diameter = args.tool_diameter
-        self.feed_rate = args.feed_rate
-        self.plunge_rate = args.plunge_rate
-        self.cut_depth = args.cut_depth
-        self.safe_height = args.safe_height
-        self.spindle_speed = args.spindle_speed
-        self.isolation_passes = args.isolation_passes
-        self.isolation_step = args.isolation_step
-        self.dpi = args.dpi
-        self.invert = args.invert
-        
-    def generate_gcode_header(self) -> str:
+    def __init__(self, config_file: Optional[str] = None):
+        self.config = self.load_config(config_file)
+        self.safe_height = self.config.get('general', {}).get('safe_height', 2.0)
+        self.dpi = self.config.get('general', {}).get('dpi', 1000)
+        self.edge_margin = self.config.get('edge_margin', 1.0)
+        self.separate_files = self.config.get('output', {}).get('separate_files', False)
+        self.file_prefix = self.config.get('output', {}).get('file_prefix', 'pcb')
+
+        # Tool presets
+        tools_config = self.config.get('tools', {})
+        self.isolation_tool = ToolPreset(tools_config.get('isolation', {}))
+        self.edge_cuts_tool = ToolPreset(tools_config.get('edge_cuts', {}))
+        self.drill_tool = ToolPreset(tools_config.get('drill', {}))
+
+        # File paths
+        self.traces_file = None
+        self.edge_cuts_file = None
+        self.drill_file = None
+        self.output_file = None
+
+        # Processed data
+        self.trace_bounds = None
+        self.board_outline = None
+
+    def load_config(self, config_file: Optional[str]) -> Dict:
+        """Load configuration from YAML file or return defaults"""
+        default_config = {
+            'general': {'safe_height': 2.0, 'dpi': 1000},
+            'tools': {
+                'isolation': {
+                    'tool_diameter': 0.1, 'spindle_speed': 10000,
+                    'feed_rate': 200, 'plunge_rate': 50, 'cut_depth': 0.1,
+                    'passes': 1, 'step_over': 0.1
+                },
+                'edge_cuts': {
+                    'tool_diameter': 2.0, 'spindle_speed': 8000,
+                    'feed_rate': 150, 'plunge_rate': 30, 'cut_depth': 0.5,
+                    'total_depth': 1.6
+                },
+                'drill': {
+                    'tool_diameter': 0.8, 'spindle_speed': 12000,
+                    'feed_rate': 100, 'plunge_rate': 60, 'cut_depth': 0.5,
+                    'total_depth': 1.8, 'retract_height': 1.0
+                }
+            },
+            'edge_margin': 1.0,
+            'output': {'separate_files': False, 'file_prefix': 'pcb'}
+        }
+
+        if config_file and os.path.exists(config_file):
+            try:
+                with open(config_file, 'r') as f:
+                    loaded = yaml.safe_load(f)
+                    # Merge with defaults
+                    self._deep_merge(default_config, loaded)
+                    print(f"Loaded configuration from {config_file}")
+                    return default_config
+            except Exception as e:
+                print(f"Warning: Could not load config file: {e}")
+                print("Using default configuration")
+
+        return default_config
+
+    def _deep_merge(self, base: Dict, override: Dict):
+        """Deep merge override into base dict"""
+        for key, value in override.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                self._deep_merge(base[key], value)
+            else:
+                base[key] = value
+
+    def generate_gcode_header(self, operation: str, tool: ToolPreset) -> str:
         """Generate G-code header with initialization commands"""
         header = [
-            "; G-code generated by Gerber to G-code converter",
-            f"; Input file: {self.input_file}",
-            f"; Tool diameter: {self.tool_diameter} mm",
-            f"; Feed rate: {self.feed_rate} mm/min",
-            f"; Cut depth: {self.cut_depth} mm",
+            f"; G-code generated by Gerber to G-code converter",
+            f"; Operation: {operation}",
+            f"; Tool diameter: {tool.tool_diameter} mm",
+            f"; Feed rate: {tool.feed_rate} mm/min",
+            f"; Cut depth: {tool.cut_depth} mm",
             "",
             "G21         ; Set units to millimeters",
             "G90         ; Absolute positioning",
             "G94         ; Feed rate per minute",
-            f"M3 S{self.spindle_speed}  ; Start spindle",
+            f"M3 S{tool.spindle_speed}  ; Start spindle",
             "G4 P2       ; Dwell 2 seconds for spindle to reach speed",
             f"G0 Z{self.safe_height}    ; Move to safe height",
             ""
         ]
         return "\n".join(header)
-    
+
     def generate_gcode_footer(self) -> str:
         """Generate G-code footer with shutdown commands"""
         footer = [
@@ -75,23 +156,33 @@ class GerberToGcode:
             ""
         ]
         return "\n".join(footer)
-    
-    def render_gerber_to_bitmap(self) -> np.ndarray:
+
+    def generate_tool_change(self, operation: str, tool: ToolPreset) -> List[str]:
+        """Generate G-code for tool change"""
+        return [
+            "",
+            f"; ========== TOOL CHANGE: {operation} ==========",
+            f"; Tool: {tool.tool_diameter} mm",
+            f"G0 Z{self.safe_height}    ; Move to safe height",
+            "M5          ; Stop spindle",
+            "G0 X0 Y0    ; Move to tool change position",
+            f"M0          ; Pause for tool change - {operation}",
+            f"M3 S{tool.spindle_speed}  ; Start spindle",
+            "G4 P2       ; Dwell for spindle",
+            ""
+        ]
+
+    def render_gerber_to_bitmap(self, gerber_file: str) -> np.ndarray:
         """Render Gerber file to a bitmap image using pygerber"""
         from io import BytesIO
 
         try:
-            # Load the Gerber file
-            gerber_file = GerberFile.from_file(
-                self.input_file,
+            gf = GerberFile.from_file(
+                gerber_file,
                 file_type=FileTypeEnum.INFER_FROM_EXTENSION
             )
+            parsed_file = gf.parse()
 
-            # Parse the Gerber file
-            parsed_file = gerber_file.parse()
-
-            # Render to raster image in memory
-            # Convert DPI to DPMM (dots per millimeter): dpmm = dpi / 25.4
             dpmm = int(self.dpi / 25.4)
             buffer = BytesIO()
             parsed_file.render_raster(
@@ -101,26 +192,19 @@ class GerberToGcode:
                 image_format=ImageFormatEnum.PNG,
             )
 
-            # Load the image from the buffer
             buffer.seek(0)
             pil_image = Image.open(buffer)
-
-            # Convert to grayscale then to numpy array
             pil_image = pil_image.convert('L')
             img_array = np.array(pil_image)
-
-            # Invert if needed (for isolation routing)
-            if self.invert:
-                img_array = 255 - img_array
 
             return img_array
 
         except Exception as e:
-            print(f"Error rendering Gerber file: {e}")
+            print(f"Error rendering Gerber file {gerber_file}: {e}")
             import traceback
             traceback.print_exc()
             sys.exit(1)
-    
+
     def smooth_path(self, path: np.ndarray, tolerance: float = 0.5) -> np.ndarray:
         """Smooth a path using Douglas-Peucker algorithm"""
         from skimage.measure import approximate_polygon
@@ -128,167 +212,471 @@ class GerberToGcode:
             return path
         return approximate_polygon(path, tolerance=tolerance)
 
+    def get_trace_bounds_from_bitmap(self, bitmap: np.ndarray) -> Tuple[float, float, float, float]:
+        """Get bounding box of traces from bitmap (min_x, min_y, max_x, max_y) in mm"""
+        val_min, val_max = bitmap.min(), bitmap.max()
+        threshold = val_min + (val_max - val_min) * 0.4
+        binary = bitmap > threshold
+
+        rows, cols = np.where(binary)
+        if len(rows) == 0:
+            return (0, 0, bitmap.shape[1], bitmap.shape[0])
+
+        scale_factor = 25.4 / self.dpi
+        min_x = cols.min() * scale_factor
+        max_x = cols.max() * scale_factor
+        min_y = rows.min() * scale_factor
+        max_y = rows.max() * scale_factor
+
+        return (min_x, min_y, max_x, max_y)
+
     def bitmap_to_toolpaths(self, bitmap: np.ndarray) -> List[List[Tuple[float, float]]]:
         """Convert bitmap to toolpaths using contour detection"""
         from skimage import measure, morphology
 
-        # Threshold the image using a slightly lower threshold for better sensitivity
         val_min, val_max = bitmap.min(), bitmap.max()
-        threshold = val_min + (val_max - val_min) * 0.4  # Lower threshold = more sensitive
+        threshold = val_min + (val_max - val_min) * 0.4
         binary = bitmap > threshold
 
-        # Add padding around the image to prevent border contours from being cut off
         pad_size = 2
         binary = np.pad(binary, pad_size, mode='constant', constant_values=False)
 
-        # Morphological operations to improve edge detection
-        # Close small gaps in the binary image
         binary = morphology.closing(binary, morphology.disk(1))
-        # Remove small noise
         binary = morphology.remove_small_objects(binary, max_size=10)
         binary = morphology.remove_small_holes(binary, max_size=10)
 
-        # Find contours using marching squares algorithm
         contours = measure.find_contours(binary.astype(float), 0.5)
-
-        # Adjust contour coordinates to account for padding
         contours = [contour - pad_size for contour in contours]
 
-        # Convert pixel coordinates to mm
         scale_factor = 25.4 / self.dpi
-
-        # Smoothing tolerance in pixels (adjust based on DPI)
         smooth_tolerance = max(0.5, self.dpi / 2000)
 
         paths = []
         for contour in contours:
-            # Smooth the contour to reduce choppiness at turns
             smoothed = self.smooth_path(contour, tolerance=smooth_tolerance)
-
-            # Convert to (x, y) in mm - note: row=Y, col=X
             path = [(point[1] * scale_factor, point[0] * scale_factor)
                     for point in smoothed]
             if len(path) >= 2:
                 paths.append(path)
 
-        print(f"Found {len(paths)} contours")
         return paths
-    
-    def toolpaths_to_gcode(self, paths: List[List[Tuple[float, float]]]) -> List[str]:
-        """Convert toolpaths to G-code commands"""
-        gcode_lines = []
-        
-        for pass_num in range(self.isolation_passes):
-            offset = pass_num * self.isolation_step
-            
+
+    def process_traces(self, bitmap: np.ndarray) -> List[str]:
+        """Generate G-code for isolation routing of traces"""
+        tool = self.isolation_tool
+        paths = self.bitmap_to_toolpaths(bitmap)
+        print(f"Found {len(paths)} trace contours")
+
+        gcode_lines = ["; Isolation routing"]
+
+        for pass_num in range(tool.passes):
+            offset = pass_num * tool.step_over
             gcode_lines.append(f"; Isolation pass {pass_num + 1}")
-            
+
             for path in paths:
                 if len(path) == 0:
                     continue
-                
-                # Move to start of path at safe height
+
                 x, y = path[0]
                 x += offset
                 gcode_lines.append(f"G0 X{x:.4f} Y{y:.4f} Z{self.safe_height}")
-                
-                # Plunge to cutting depth
-                gcode_lines.append(f"G1 Z{-self.cut_depth:.4f} F{self.plunge_rate}")
-                
-                # Cut along path
+                gcode_lines.append(f"G1 Z{-tool.cut_depth:.4f} F{tool.plunge_rate}")
+
                 for x, y in path[1:]:
                     x += offset
-                    gcode_lines.append(f"G1 X{x:.4f} Y{y:.4f} F{self.feed_rate}")
-                
-                # Retract to safe height
+                    gcode_lines.append(f"G1 X{x:.4f} Y{y:.4f} F{tool.feed_rate}")
+
                 gcode_lines.append(f"G0 Z{self.safe_height}")
-            
+
             gcode_lines.append("")
-        
+
         return gcode_lines
-    
-    def convert(self):
+
+    def parse_edge_cuts_to_outline(self, bitmap: np.ndarray) -> List[Tuple[float, float]]:
+        """Parse edge cuts bitmap and return board outline"""
+        from skimage import measure
+
+        val_min, val_max = bitmap.min(), bitmap.max()
+        threshold = val_min + (val_max - val_min) * 0.4
+        binary = bitmap > threshold
+
+        contours = measure.find_contours(binary.astype(float), 0.5)
+
+        if not contours:
+            return []
+
+        largest_contour = max(contours, key=len)
+        smoothed = self.smooth_path(largest_contour, tolerance=1.0)
+        scale_factor = 25.4 / self.dpi
+
+        outline = [(point[1] * scale_factor, point[0] * scale_factor)
+                   for point in smoothed]
+
+        return outline
+
+    def impute_edge_cuts(self, trace_bounds: Tuple[float, float, float, float]) -> List[Tuple[float, float]]:
+        """Generate rectangular board outline from trace bounds plus margin"""
+        min_x, min_y, max_x, max_y = trace_bounds
+        margin = self.edge_margin
+
+        outline = [
+            (min_x - margin, min_y - margin),
+            (max_x + margin, min_y - margin),
+            (max_x + margin, max_y + margin),
+            (min_x - margin, max_y + margin),
+            (min_x - margin, min_y - margin),
+        ]
+
+        return outline
+
+    def process_edge_cuts(self, outline: List[Tuple[float, float]]) -> List[str]:
+        """Generate G-code for board cutout"""
+        if not outline:
+            return []
+
+        tool = self.edge_cuts_tool
+        gcode_lines = [
+            "; Board cutout",
+            f"; Total depth: {tool.total_depth} mm",
+        ]
+
+        passes_needed = max(1, int(np.ceil(tool.total_depth / tool.cut_depth)))
+
+        for pass_num in range(passes_needed):
+            current_depth = min((pass_num + 1) * tool.cut_depth, tool.total_depth)
+            gcode_lines.append(f"; Cutout pass {pass_num + 1} (depth: {current_depth:.2f} mm)")
+
+            x, y = outline[0]
+            gcode_lines.append(f"G0 X{x:.4f} Y{y:.4f} Z{self.safe_height}")
+            gcode_lines.append(f"G1 Z{-current_depth:.4f} F{tool.plunge_rate}")
+
+            for x, y in outline[1:]:
+                gcode_lines.append(f"G1 X{x:.4f} Y{y:.4f} F{tool.feed_rate}")
+
+            gcode_lines.append(f"G0 Z{self.safe_height}")
+
+        return gcode_lines
+
+    def parse_drill_file(self, drill_file: str) -> List[Tuple[float, float, float]]:
+        """Parse Excellon drill file and return list of (x, y, diameter) holes"""
+        holes = []
+
+        try:
+            with open(drill_file, 'r') as f:
+                content = f.read()
+
+            # Parse tool definitions (T01C0.8 = tool 1, 0.8mm diameter)
+            tool_diameters = {}
+            tool_pattern = re.compile(r'T(\d+)C([\d.]+)')
+            for match in tool_pattern.finditer(content):
+                tool_num = int(match.group(1))
+                diameter = float(match.group(2))
+                tool_diameters[tool_num] = diameter
+
+            # Parse coordinates
+            current_tool = None
+            # Excellon format can be INCH or METRIC
+            unit_scale = 1.0  # Assume mm by default
+
+            if 'INCH' in content.upper():
+                unit_scale = 25.4
+            elif 'METRIC' in content.upper() or 'M71' in content:
+                unit_scale = 1.0
+
+            lines = content.split('\n')
+            for line in lines:
+                line = line.strip()
+
+                # Tool selection
+                tool_select = re.match(r'^T(\d+)$', line)
+                if tool_select:
+                    current_tool = int(tool_select.group(1))
+                    continue
+
+                # Coordinate (X123Y456 format)
+                coord_match = re.match(r'^X([-\d.]+)Y([-\d.]+)', line)
+                if coord_match and current_tool is not None:
+                    x = float(coord_match.group(1))
+                    y = float(coord_match.group(2))
+
+                    # Handle integer format (divide by 10000 for 2.4 format)
+                    if '.' not in coord_match.group(1):
+                        x = x / 10000.0
+                    if '.' not in coord_match.group(2):
+                        y = y / 10000.0
+
+                    x *= unit_scale
+                    y *= unit_scale
+
+                    diameter = tool_diameters.get(current_tool, self.drill_tool.tool_diameter)
+                    holes.append((x, y, diameter))
+
+            print(f"Found {len(holes)} drill holes")
+            return holes
+
+        except Exception as e:
+            print(f"Error parsing drill file: {e}")
+            return []
+
+    def process_drill_holes(self, holes: List[Tuple[float, float, float]]) -> List[str]:
+        """Generate G-code for drilling holes"""
+        if not holes:
+            return []
+
+        tool = self.drill_tool
+        gcode_lines = [
+            "; Drilling",
+            f"; Total depth: {tool.total_depth} mm",
+        ]
+
+        # Group holes by diameter for efficiency
+        holes_by_diameter = {}
+        for x, y, d in holes:
+            if d not in holes_by_diameter:
+                holes_by_diameter[d] = []
+            holes_by_diameter[d].append((x, y))
+
+        for diameter, hole_list in sorted(holes_by_diameter.items()):
+            gcode_lines.append(f"; Holes: {diameter:.2f} mm diameter ({len(hole_list)} holes)")
+
+            for x, y in hole_list:
+                gcode_lines.append(f"G0 X{x:.4f} Y{y:.4f} Z{self.safe_height}")
+
+                if tool.cut_depth > 0 and tool.cut_depth < tool.total_depth:
+                    # Peck drilling
+                    current_depth = 0
+                    while current_depth < tool.total_depth:
+                        current_depth = min(current_depth + tool.cut_depth, tool.total_depth)
+                        gcode_lines.append(f"G1 Z{-current_depth:.4f} F{tool.plunge_rate}")
+                        gcode_lines.append(f"G0 Z{tool.retract_height}")
+                    gcode_lines.append(f"G0 Z{self.safe_height}")
+                else:
+                    # Single plunge
+                    gcode_lines.append(f"G1 Z{-tool.total_depth:.4f} F{tool.plunge_rate}")
+                    gcode_lines.append(f"G0 Z{self.safe_height}")
+
+        return gcode_lines
+
+    def generate_edge_cuts_gerber(self, outline: List[Tuple[float, float]], output_file: str):
+        """Generate a Gerber file for the board edge cuts"""
+        gerber_lines = [
+            "G04 Edge cuts generated by Gerber to G-code converter*",
+            "%FSLAX36Y36*%",
+            "%MOIN*%",
+            "%ADD10C,0.01*%",
+            "D10*",
+            "G01*",
+        ]
+
+        for i, (x, y) in enumerate(outline):
+            x_inch = x / 25.4
+            y_inch = y / 25.4
+            x_gerber = int(x_inch * 1000000)
+            y_gerber = int(y_inch * 1000000)
+
+            if i == 0:
+                gerber_lines.append(f"X{x_gerber}Y{y_gerber}D02*")
+            else:
+                gerber_lines.append(f"X{x_gerber}Y{y_gerber}D01*")
+
+        gerber_lines.append("M02*")
+
+        with open(output_file, 'w') as f:
+            f.write('\n'.join(gerber_lines))
+
+        print(f"Edge cuts Gerber written to {output_file}")
+
+    def convert(self, traces_file: str = None, edge_cuts_file: str = None,
+                drill_file: str = None, output_file: str = None,
+                generate_edge_cuts: str = None):
         """Main conversion process"""
-        print(f"Converting {self.input_file} to G-code...")
-        print(f"Tool diameter: {self.tool_diameter} mm")
-        print(f"Feed rate: {self.feed_rate} mm/min")
-        print(f"Cut depth: {self.cut_depth} mm")
-        
-        # Render Gerber to bitmap
-        print("Rendering Gerber file...")
-        bitmap = self.render_gerber_to_bitmap()
-        
-        # Convert bitmap to toolpaths
-        print("Generating toolpaths...")
-        paths = self.bitmap_to_toolpaths(bitmap)
-        
-        # Generate G-code
-        print("Generating G-code...")
+
+        self.traces_file = traces_file
+        self.edge_cuts_file = edge_cuts_file
+        self.drill_file = drill_file
+        self.output_file = output_file or 'output.nc'
+
+        operations = []
+        gcode_sections = {}
+
+        # Process traces
+        if traces_file and os.path.exists(traces_file):
+            print(f"\n=== Processing traces: {traces_file} ===")
+            bitmap = self.render_gerber_to_bitmap(traces_file)
+            self.trace_bounds = self.get_trace_bounds_from_bitmap(bitmap)
+            print(f"Trace bounds: X={self.trace_bounds[0]:.2f}-{self.trace_bounds[2]:.2f} mm, "
+                  f"Y={self.trace_bounds[1]:.2f}-{self.trace_bounds[3]:.2f} mm")
+
+            gcode_sections['isolation'] = self.process_traces(bitmap)
+            operations.append('isolation')
+
+        # Process or impute edge cuts
+        if edge_cuts_file and os.path.exists(edge_cuts_file):
+            print(f"\n=== Processing edge cuts: {edge_cuts_file} ===")
+            bitmap = self.render_gerber_to_bitmap(edge_cuts_file)
+            self.board_outline = self.parse_edge_cuts_to_outline(bitmap)
+            print(f"Loaded board outline with {len(self.board_outline)} points")
+        elif self.trace_bounds:
+            print(f"\n=== Imputing edge cuts from trace bounds ===")
+            self.board_outline = self.impute_edge_cuts(self.trace_bounds)
+            width = self.trace_bounds[2] - self.trace_bounds[0] + 2 * self.edge_margin
+            height = self.trace_bounds[3] - self.trace_bounds[1] + 2 * self.edge_margin
+            print(f"Imputed board size: {width:.2f} x {height:.2f} mm")
+
+        # Generate edge cuts Gerber if requested
+        if generate_edge_cuts and self.board_outline:
+            self.generate_edge_cuts_gerber(self.board_outline, generate_edge_cuts)
+
+        # Add edge cuts to operations if we have an outline
+        if self.board_outline:
+            gcode_sections['edge_cuts'] = self.process_edge_cuts(self.board_outline)
+            operations.append('edge_cuts')
+
+        # Process drill file
+        if drill_file and os.path.exists(drill_file):
+            print(f"\n=== Processing drill file: {drill_file} ===")
+            holes = self.parse_drill_file(drill_file)
+            if holes:
+                gcode_sections['drill'] = self.process_drill_holes(holes)
+                operations.append('drill')
+
+        # Generate output
+        if self.separate_files:
+            self._write_separate_files(gcode_sections)
+        else:
+            self._write_combined_file(operations, gcode_sections)
+
+    def _write_separate_files(self, gcode_sections: Dict[str, List[str]]):
+        """Write separate G-code files for each operation"""
+        tools = {
+            'isolation': self.isolation_tool,
+            'edge_cuts': self.edge_cuts_tool,
+            'drill': self.drill_tool
+        }
+
+        for operation, gcode_lines in gcode_sections.items():
+            if not gcode_lines:
+                continue
+
+            filename = f"{self.file_prefix}_{operation}.nc"
+            tool = tools[operation]
+
+            with open(filename, 'w') as f:
+                f.write(self.generate_gcode_header(operation, tool))
+                f.write('\n'.join(gcode_lines))
+                f.write(self.generate_gcode_footer())
+
+            print(f"Written {filename}")
+
+    def _write_combined_file(self, operations: List[str], gcode_sections: Dict[str, List[str]]):
+        """Write combined G-code file with tool changes"""
+        tools = {
+            'isolation': self.isolation_tool,
+            'edge_cuts': self.edge_cuts_tool,
+            'drill': self.drill_tool
+        }
+
         gcode = []
-        gcode.append(self.generate_gcode_header())
-        gcode.extend(self.toolpaths_to_gcode(paths))
+
+        # Header for first operation
+        if operations:
+            first_op = operations[0]
+            gcode.append(self.generate_gcode_header(first_op, tools[first_op]))
+            gcode.extend(gcode_sections[first_op])
+
+            # Subsequent operations with tool changes
+            for operation in operations[1:]:
+                if operation in gcode_sections and gcode_sections[operation]:
+                    gcode.extend(self.generate_tool_change(operation, tools[operation]))
+                    gcode.extend(gcode_sections[operation])
+
         gcode.append(self.generate_gcode_footer())
-        
-        # Write to file
+
         with open(self.output_file, 'w') as f:
             f.write('\n'.join(gcode))
-        
-        print(f"G-code written to {self.output_file}")
-        print(f"Total lines: {len(gcode)}")
+
+        print(f"\nG-code written to {self.output_file}")
+        print(f"Operations: {', '.join(operations)}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description='Convert Gerber files to GRBL G-code for PCB milling',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic isolation routing
+  %(prog)s -t traces.gbr -o output.nc
+
+  # Full PCB with all files
+  %(prog)s -t traces.gbr -e edges.gbr -d holes.drl -o output.nc
+
+  # Use custom config file
+  %(prog)s -t traces.gbr --config my_config.yaml
+
+  # Generate separate files for each operation
+  %(prog)s -t traces.gbr -e edges.gbr --separate
+        """
     )
-    
-    # Input/Output
-    parser.add_argument('input', help='Input Gerber file (.gbr, .gtl, .gbl, etc.)')
-    parser.add_argument('-o', '--output', help='Output G-code file', default='output.nc')
-    
-    # Tool settings
-    parser.add_argument('-d', '--tool-diameter', type=float, default=0.1,
-                       help='Tool diameter in mm')
-    
-    # Feed rates
-    parser.add_argument('-f', '--feed-rate', type=int, default=200,
-                       help='Cutting feed rate in mm/min')
-    parser.add_argument('-p', '--plunge-rate', type=int, default=50,
-                       help='Plunge feed rate in mm/min')
-    
-    # Cut parameters
-    parser.add_argument('-c', '--cut-depth', type=float, default=0.1,
-                       help='Depth of cut in mm (positive value)')
-    parser.add_argument('-z', '--safe-height', type=float, default=2.0,
-                       help='Safe Z height for rapid moves in mm')
-    
-    # Spindle
-    parser.add_argument('-s', '--spindle-speed', type=int, default=10000,
-                       help='Spindle speed in RPM')
-    
-    # Isolation routing
-    parser.add_argument('-i', '--isolation-passes', type=int, default=1,
-                       help='Number of isolation passes')
-    parser.add_argument('--isolation-step', type=float, default=0.1,
-                       help='Step over between isolation passes in mm')
-    
-    # Rendering
-    parser.add_argument('--dpi', type=int, default=1000,
-                       help='DPI for Gerber rendering')
-    parser.add_argument('--invert', action='store_true',
-                       help='Invert the Gerber image (for isolation routing)')
-    
+
+    # Input files
+    parser.add_argument('-t', '--traces', type=str,
+                        help='Copper traces Gerber file (.gbr, .gtl, .gbl)')
+    parser.add_argument('-e', '--edge-cuts', type=str,
+                        help='Edge cuts Gerber file for board outline')
+    parser.add_argument('-d', '--drill', type=str,
+                        help='Excellon drill file (.drl, .xln)')
+
+    # Legacy positional argument support
+    parser.add_argument('input', nargs='?',
+                        help='Input Gerber file (legacy, use -t instead)')
+
+    # Output
+    parser.add_argument('-o', '--output', type=str, default='output.nc',
+                        help='Output G-code file (default: output.nc)')
+    parser.add_argument('--separate', action='store_true',
+                        help='Generate separate files for each operation')
+    parser.add_argument('--generate-edge-cuts', type=str,
+                        help='Output file for generated edge cuts Gerber')
+
+    # Configuration
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='YAML configuration file (default: config.yaml)')
+
+    # Quick overrides (optional, config file takes precedence)
+    parser.add_argument('--edge-margin', type=float,
+                        help='Override edge margin for imputed board outline (mm)')
+    parser.add_argument('--dpi', type=int,
+                        help='Override DPI for Gerber rendering')
+
     args = parser.parse_args()
-    
-    # Validate input file
-    if not os.path.exists(args.input):
-        print(f"Error: Input file '{args.input}' not found")
+
+    # Handle legacy positional argument
+    traces_file = args.traces or args.input
+    if not traces_file and not args.edge_cuts and not args.drill:
+        parser.print_help()
+        print("\nError: At least one input file is required (-t, -e, or -d)")
         sys.exit(1)
-    
-    # Create converter and run
-    converter = GerberToGcode(args)
-    converter.convert()
+
+    # Create converter
+    converter = GerberToGcode(args.config)
+
+    # Apply command-line overrides
+    if args.edge_margin is not None:
+        converter.edge_margin = args.edge_margin
+    if args.dpi is not None:
+        converter.dpi = args.dpi
+    if args.separate:
+        converter.separate_files = True
+
+    # Run conversion
+    converter.convert(
+        traces_file=traces_file,
+        edge_cuts_file=args.edge_cuts,
+        drill_file=args.drill,
+        output_file=args.output,
+        generate_edge_cuts=args.generate_edge_cuts
+    )
 
 
 if __name__ == '__main__':

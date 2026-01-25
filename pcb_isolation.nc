@@ -10,7 +10,6 @@ G94         ; Feed rate per minute
 M3 S10000  ; Start spindle
 G4 P2       ; Dwell 2 seconds for spindle to reach speed
 G0 Z2.0    ; Move to safe height
-
 ; Isolation routing
 ; Isolation pass 1
 G0 X8.4074 Y3.9243 Z2.0
@@ -705,51 +704,6 @@ G1 X19.9263 Y13.8430 F200
 G1 X19.9517 Y13.8684 F200
 G1 X19.9517 Y14.0462 F200
 G1 X19.8628 Y14.1097 F200
-G0 Z2.0
-
-
-; ========== TOOL CHANGE: edge_cuts ==========
-; Tool: 2.0 mm
-G0 Z2.0    ; Move to safe height
-M5          ; Stop spindle
-G0 X0 Y0    ; Move to tool change position
-M0          ; Pause for tool change - edge_cuts
-M3 S8000  ; Start spindle
-G4 P2       ; Dwell for spindle
-
-; Board cutout
-; Total depth: 1.6 mm
-; Cutout pass 1 (depth: 0.50 mm)
-G0 X-1.0000 Y-0.9746 Z2.0
-G1 Z-0.5000 F30
-G1 X20.9390 Y-0.9746 F150
-G1 X20.9390 Y15.0970 F150
-G1 X-1.0000 Y15.0970 F150
-G1 X-1.0000 Y-0.9746 F150
-G0 Z2.0
-; Cutout pass 2 (depth: 1.00 mm)
-G0 X-1.0000 Y-0.9746 Z2.0
-G1 Z-1.0000 F30
-G1 X20.9390 Y-0.9746 F150
-G1 X20.9390 Y15.0970 F150
-G1 X-1.0000 Y15.0970 F150
-G1 X-1.0000 Y-0.9746 F150
-G0 Z2.0
-; Cutout pass 3 (depth: 1.50 mm)
-G0 X-1.0000 Y-0.9746 Z2.0
-G1 Z-1.5000 F30
-G1 X20.9390 Y-0.9746 F150
-G1 X20.9390 Y15.0970 F150
-G1 X-1.0000 Y15.0970 F150
-G1 X-1.0000 Y-0.9746 F150
-G0 Z2.0
-; Cutout pass 4 (depth: 1.60 mm)
-G0 X-1.0000 Y-0.9746 Z2.0
-G1 Z-1.6000 F30
-G1 X20.9390 Y-0.9746 F150
-G1 X20.9390 Y15.0970 F150
-G1 X-1.0000 Y15.0970 F150
-G1 X-1.0000 Y-0.9746 F150
 G0 Z2.0
 
 G0 Z2.0    ; Move to safe height
