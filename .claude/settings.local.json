@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python gerber_to_gcode.py:*)"
+    ]
+  }
+}
