@@ -121,34 +121,57 @@ class GerberToGcode:
             traceback.print_exc()
             sys.exit(1)
     
-    def bitmap_to_toolpaths(self, bitmap: np.ndarray) -> List[List[Tuple[float, float]]]:
-        """Convert bitmap to toolpaths using edge detection"""
-        from scipy import ndimage
+    def smooth_path(self, path: np.ndarray, tolerance: float = 0.5) -> np.ndarray:
+        """Smooth a path using Douglas-Peucker algorithm"""
+        from skimage.measure import approximate_polygon
+        if len(path) < 3:
+            return path
+        return approximate_polygon(path, tolerance=tolerance)
 
-        # Threshold the image using the midpoint of actual values
-        threshold = (bitmap.min() + bitmap.max()) / 2
+    def bitmap_to_toolpaths(self, bitmap: np.ndarray) -> List[List[Tuple[float, float]]]:
+        """Convert bitmap to toolpaths using contour detection"""
+        from skimage import measure, morphology
+
+        # Threshold the image using a slightly lower threshold for better sensitivity
+        val_min, val_max = bitmap.min(), bitmap.max()
+        threshold = val_min + (val_max - val_min) * 0.4  # Lower threshold = more sensitive
         binary = bitmap > threshold
-        
-        # Edge detection
-        edges = ndimage.sobel(binary.astype(float))
-        
-        # Find contours (simplified approach)
-        # For production use, consider using opencv or similar
+
+        # Add padding around the image to prevent border contours from being cut off
+        pad_size = 2
+        binary = np.pad(binary, pad_size, mode='constant', constant_values=False)
+
+        # Morphological operations to improve edge detection
+        # Close small gaps in the binary image
+        binary = morphology.closing(binary, morphology.disk(1))
+        # Remove small noise
+        binary = morphology.remove_small_objects(binary, max_size=10)
+        binary = morphology.remove_small_holes(binary, max_size=10)
+
+        # Find contours using marching squares algorithm
+        contours = measure.find_contours(binary.astype(float), 0.5)
+
+        # Adjust contour coordinates to account for padding
+        contours = [contour - pad_size for contour in contours]
+
+        # Convert pixel coordinates to mm
+        scale_factor = 25.4 / self.dpi
+
+        # Smoothing tolerance in pixels (adjust based on DPI)
+        smooth_tolerance = max(0.5, self.dpi / 2000)
+
         paths = []
-        
-        # This is a simplified version - you may want to use proper contouring
-        # For now, we'll trace along edges
-        edge_points = np.argwhere(edges > 0)
-        
-        if len(edge_points) > 0:
-            # Convert pixel coordinates to mm (assuming typical PCB DPI)
-            # You'll need to adjust scaling based on actual Gerber units
-            scale_factor = 25.4 / self.dpi  # Convert pixels to mm
-            
-            path = [(point[1] * scale_factor, point[0] * scale_factor) 
-                   for point in edge_points]
-            paths.append(path)
-        
+        for contour in contours:
+            # Smooth the contour to reduce choppiness at turns
+            smoothed = self.smooth_path(contour, tolerance=smooth_tolerance)
+
+            # Convert to (x, y) in mm - note: row=Y, col=X
+            path = [(point[1] * scale_factor, point[0] * scale_factor)
+                    for point in smoothed]
+            if len(path) >= 2:
+                paths.append(path)
+
+        print(f"Found {len(paths)} contours")
         return paths
     
     def toolpaths_to_gcode(self, paths: List[List[Tuple[float, float]]]) -> List[str]:

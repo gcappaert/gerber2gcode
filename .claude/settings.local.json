@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python gerber_to_gcode.py:*)"
+      "Bash(python gerber_to_gcode.py:*)",
+      "Bash(./venv/Scripts/python.exe:*)"
     ]
   }
 }
