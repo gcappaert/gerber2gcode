@@ -52,6 +52,15 @@ class ToolPreset:
         self.tabs = config.get('tabs', False)
         self.tab_width = config.get('tab_width', 2.0)
         self.tab_height = config.get('tab_height', 0.3)
+        self.isolation_border = config.get('isolation_border', 0.0)  # mm
+        # Laser-specific attributes
+        self.power = config.get('power', 800)
+        self.focus_height = config.get('focus_height', 50.0)
+        self.dynamic_mode = config.get('dynamic_mode', True)
+        self.fill_line_spacing = config.get('fill_line_spacing', 0.1)
+        self.trace_border_passes = config.get('trace_border_passes', 0)
+        self.pad_min_area = config.get('pad_min_area', 1.0)
+        self.pad_max_eccentricity = config.get('pad_max_eccentricity', 0.8)
 
 
 class GerberToGcode:
@@ -68,6 +77,7 @@ class GerberToGcode:
         self.isolation_tool = ToolPreset(tools_config.get('isolation', {}))
         self.edge_cuts_tool = ToolPreset(tools_config.get('edge_cuts', {}))
         self.drill_tool = ToolPreset(tools_config.get('drill', {}))
+        self.laser_tool = ToolPreset(tools_config.get('laser', {}))
 
         # File paths
         self.traces_file = None
@@ -172,8 +182,9 @@ class GerberToGcode:
             ""
         ]
 
-    def render_gerber_to_bitmap(self, gerber_file: str) -> np.ndarray:
-        """Render Gerber file to a bitmap image using pygerber"""
+    def render_gerber_to_bitmap(self, gerber_file: str) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+        """Render Gerber file to a bitmap image using pygerber.
+        Returns (bitmap, gerber_bounds) where gerber_bounds is (min_x, min_y, max_x, max_y) in mm."""
         from io import BytesIO
 
         try:
@@ -182,6 +193,17 @@ class GerberToGcode:
                 file_type=FileTypeEnum.INFER_FROM_EXTENSION
             )
             parsed_file = gf.parse()
+
+            # Extract the actual Gerber coordinate bounds
+            info = parsed_file.get_info()
+            gerber_bounds = (
+                float(info.min_x_mm),
+                float(info.min_y_mm),
+                float(info.max_x_mm),
+                float(info.max_y_mm),
+            )
+            print(f"Gerber bounds: X={gerber_bounds[0]:.4f}-{gerber_bounds[2]:.4f} mm, "
+                  f"Y={gerber_bounds[1]:.4f}-{gerber_bounds[3]:.4f} mm")
 
             dpmm = int(self.dpi / 25.4)
             buffer = BytesIO()
@@ -197,7 +219,7 @@ class GerberToGcode:
             pil_image = pil_image.convert('L')
             img_array = np.array(pil_image)
 
-            return img_array
+            return img_array, gerber_bounds
 
         except Exception as e:
             print(f"Error rendering Gerber file {gerber_file}: {e}")
@@ -212,31 +234,47 @@ class GerberToGcode:
             return path
         return approximate_polygon(path, tolerance=tolerance)
 
-    def get_trace_bounds_from_bitmap(self, bitmap: np.ndarray) -> Tuple[float, float, float, float]:
-        """Get bounding box of traces from bitmap (min_x, min_y, max_x, max_y) in mm"""
+    def get_trace_bounds_from_bitmap(self, bitmap: np.ndarray,
+                                     gerber_bounds: Tuple[float, float, float, float]
+                                     ) -> Tuple[float, float, float, float]:
+        """Get bounding box of traces from bitmap (min_x, min_y, max_x, max_y) in mm,
+        mapped back to absolute Gerber coordinates."""
         val_min, val_max = bitmap.min(), bitmap.max()
         threshold = val_min + (val_max - val_min) * 0.4
         binary = bitmap > threshold
 
         rows, cols = np.where(binary)
         if len(rows) == 0:
-            return (0, 0, bitmap.shape[1], bitmap.shape[0])
+            return gerber_bounds
 
+        gb_min_x, gb_min_y, gb_max_x, gb_max_y = gerber_bounds
         scale_factor = 25.4 / self.dpi
-        min_x = cols.min() * scale_factor
-        max_x = cols.max() * scale_factor
-        min_y = rows.min() * scale_factor
-        max_y = rows.max() * scale_factor
+
+        # Bitmap pixel coords to mm, then offset by Gerber origin
+        min_x = cols.min() * scale_factor + gb_min_x
+        max_x = cols.max() * scale_factor + gb_min_x
+        # Y-axis is flipped: bitmap row 0 = top = max Y in Gerber
+        min_y = gb_max_y - rows.max() * scale_factor
+        max_y = gb_max_y - rows.min() * scale_factor
 
         return (min_x, min_y, max_x, max_y)
 
-    def bitmap_to_toolpaths(self, bitmap: np.ndarray) -> List[List[Tuple[float, float]]]:
-        """Convert bitmap to toolpaths using contour detection"""
+    def bitmap_to_toolpaths(self, bitmap: np.ndarray,
+                            gerber_bounds: Tuple[float, float, float, float],
+                            erosion_px: float = 0
+                            ) -> List[List[Tuple[float, float]]]:
+        """Convert bitmap to toolpaths using contour detection.
+        Coordinates are mapped back to absolute Gerber coordinates using gerber_bounds.
+        erosion_px: shrink copper region by this many pixels before contouring."""
         from skimage import measure, morphology
 
         val_min, val_max = bitmap.min(), bitmap.max()
         threshold = val_min + (val_max - val_min) * 0.4
         binary = bitmap > threshold
+
+        if erosion_px > 0:
+            disk_r = max(1, round(erosion_px))
+            binary = morphology.binary_dilation(binary, morphology.disk(disk_r))
 
         pad_size = 2
         binary = np.pad(binary, pad_size, mode='constant', constant_values=False)
@@ -250,50 +288,333 @@ class GerberToGcode:
 
         scale_factor = 25.4 / self.dpi
         smooth_tolerance = max(0.5, self.dpi / 2000)
+        gb_min_x, gb_min_y, gb_max_x, gb_max_y = gerber_bounds
 
         paths = []
         for contour in contours:
             smoothed = self.smooth_path(contour, tolerance=smooth_tolerance)
-            path = [(point[1] * scale_factor, point[0] * scale_factor)
+            # point[1] = column = X, point[0] = row = Y
+            # Y-axis flipped: bitmap row 0 = top = max Y in Gerber
+            path = [(point[1] * scale_factor + gb_min_x,
+                     gb_max_y - point[0] * scale_factor)
                     for point in smoothed]
             if len(path) >= 2:
                 paths.append(path)
 
         return paths
 
-    def process_traces(self, bitmap: np.ndarray) -> List[str]:
+    def generate_alignment_mark_gcode(self, cx: float, cy: float,
+                                       tool, cut_depth: float,
+                                       laser: bool = False) -> List[str]:
+        """Generate G-code for an alignment mark: X crosshair inside a 4mm circle.
+        cx, cy is the mark centre in absolute coordinates.
+        For milling, cut_depth is the Z plunge depth (positive mm).
+        For laser, laser=True omits Z moves and uses S power instead."""
+        r = 2.0                    # circle radius → 4mm diameter (≤5mm limit)
+        arm = r / (2 ** 0.5)      # arm half-length so endpoints touch the circle
+
+        lines = [f"; Alignment mark  centre=({cx:.3f},{cy:.3f})  diam=4mm"]
+
+        if laser:
+            power = tool.power
+            feed = tool.feed_rate
+            # X arm 1: lower-left → upper-right
+            lines.append(f"G0 X{cx - arm:.4f} Y{cy - arm:.4f}")
+            lines.append(f"G1 X{cx + arm:.4f} Y{cy + arm:.4f} S{power} F{feed}")
+            lines.append(f"G1 X{cx + arm:.4f} Y{cy + arm:.4f} S0")
+            # X arm 2: upper-left → lower-right
+            lines.append(f"G0 X{cx - arm:.4f} Y{cy + arm:.4f}")
+            lines.append(f"G1 X{cx + arm:.4f} Y{cy - arm:.4f} S{power} F{feed}")
+            lines.append(f"G1 X{cx + arm:.4f} Y{cy - arm:.4f} S0")
+            # Full circle (CCW), start/end at left-most point
+            lines.append(f"G0 X{cx - r:.4f} Y{cy:.4f}")
+            lines.append(f"G3 X{cx - r:.4f} Y{cy:.4f} I{r:.4f} J0 S{power} F{feed}")
+            lines.append(f"G1 X{cx - r:.4f} Y{cy:.4f} S0")
+        else:
+            feed = tool.feed_rate
+            plunge = tool.plunge_rate
+            safe_h = self.safe_height
+            depth = -abs(cut_depth)
+            # X arm 1: lower-left → upper-right
+            lines.append(f"G0 X{cx - arm:.4f} Y{cy - arm:.4f} Z{safe_h}")
+            lines.append(f"G1 Z{depth:.4f} F{plunge}")
+            lines.append(f"G1 X{cx + arm:.4f} Y{cy + arm:.4f} F{feed}")
+            lines.append(f"G0 Z{safe_h}")
+            # X arm 2: upper-left → lower-right
+            lines.append(f"G0 X{cx - arm:.4f} Y{cy + arm:.4f}")
+            lines.append(f"G1 Z{depth:.4f} F{plunge}")
+            lines.append(f"G1 X{cx + arm:.4f} Y{cy - arm:.4f} F{feed}")
+            lines.append(f"G0 Z{safe_h}")
+            # Full circle (CCW), start/end at left-most point
+            lines.append(f"G0 X{cx - r:.4f} Y{cy:.4f}")
+            lines.append(f"G1 Z{depth:.4f} F{plunge}")
+            lines.append(f"G3 X{cx - r:.4f} Y{cy:.4f} I{r:.4f} J0 F{feed}")
+            lines.append(f"G0 Z{safe_h}")
+
+        return lines
+
+    def process_traces(self, bitmap: np.ndarray,
+                       gerber_bounds: Tuple[float, float, float, float],
+                       board_bounds: Tuple[float, float, float, float] = None) -> List[str]:
         """Generate G-code for isolation routing of traces"""
         tool = self.isolation_tool
-        paths = self.bitmap_to_toolpaths(bitmap)
-        print(f"Found {len(paths)} trace contours")
-
         gcode_lines = ["; Isolation routing"]
 
-        for pass_num in range(tool.passes):
-            offset = pass_num * tool.step_over
-            gcode_lines.append(f"; Isolation pass {pass_num + 1}")
+        scale_factor = 25.4 / self.dpi
+
+        # Pad bitmap to board bounds so traces at the edges of the copper region
+        # get fully closed contours and coordinates align with edge cuts / drill layers.
+        if board_bounds is not None:
+            bitmap, gerber_bounds = self._pad_bitmap_to_bounds(
+                bitmap, gerber_bounds, board_bounds)
+            print(f"  Bitmap padded to board bounds: "
+                  f"X={board_bounds[0]:.2f}-{board_bounds[2]:.2f} mm, "
+                  f"Y={board_bounds[1]:.2f}-{board_bounds[3]:.2f} mm")
+
+        if tool.isolation_border > 0:
+            n_extra = max(0, int(np.ceil(tool.isolation_border / tool.step_over)))
+        else:
+            n_extra = max(0, tool.passes - 1)
+
+        for pass_num in range(n_extra + 1):
+            erosion_mm = pass_num * tool.step_over
+            erosion_px = erosion_mm / scale_factor
+            paths = self.bitmap_to_toolpaths(bitmap, gerber_bounds, erosion_px=erosion_px)
+            label = "primary" if pass_num == 0 else f"border +{erosion_mm:.2f}mm"
+            print(f"  Pass {pass_num + 1} ({label}): {len(paths)} contours")
+            gcode_lines.append(f"; Isolation pass {pass_num + 1} ({label})")
 
             for path in paths:
-                if len(path) == 0:
+                if len(path) < 2:
                     continue
-
                 x, y = path[0]
-                x += offset
                 gcode_lines.append(f"G0 X{x:.4f} Y{y:.4f} Z{self.safe_height}")
                 gcode_lines.append(f"G1 Z{-tool.cut_depth:.4f} F{tool.plunge_rate}")
-
                 for x, y in path[1:]:
-                    x += offset
                     gcode_lines.append(f"G1 X{x:.4f} Y{y:.4f} F{tool.feed_rate}")
-
                 gcode_lines.append(f"G0 Z{self.safe_height}")
 
             gcode_lines.append("")
 
+        # Alignment mark: X-in-circle, 4mm diameter, cut at trace depth.
+        # Placed 3.5mm outside the bottom-left board corner so it sits in
+        # waste material and does not interfere with the board outline.
+        if board_bounds is not None:
+            mark_x = board_bounds[0] - 3.5
+            mark_y = board_bounds[1] - 3.5
+            print(f"  Alignment mark at ({mark_x:.2f}, {mark_y:.2f})")
+            gcode_lines.extend(self.generate_alignment_mark_gcode(
+                mark_x, mark_y, tool, tool.cut_depth, laser=False))
+            gcode_lines.append("")
+
         return gcode_lines
 
-    def parse_edge_cuts_to_outline(self, bitmap: np.ndarray) -> List[Tuple[float, float]]:
-        """Parse edge cuts bitmap and return board outline"""
+    def generate_laser_gcode_header(self, tool) -> str:
+        """Generate G-code header for laser operation (GRBL laser mode, $32=1)"""
+        mode = "M4" if tool.dynamic_mode else "M3"
+        return "\n".join([
+            "; Laser G-code — requires GRBL laser mode ($32=1)",
+            "G21         ; mm",
+            "G90         ; absolute",
+            "G94         ; feed per minute",
+            f"{mode} S0   ; enable laser driver (power off)",
+            "",
+        ])
+
+    def generate_laser_gcode_footer(self) -> str:
+        """Generate G-code footer for laser operation"""
+        return "\n".join(["", "M5    ; Laser off", "G0 X0 Y0", "M2", ""])
+
+    def detect_pads_and_traces(self, bitmap: np.ndarray,
+                               gerber_bounds: Tuple[float, float, float, float]):
+        """Classify copper regions into pads and traces using connected component analysis.
+        Returns (pad_mask, trace_mask) boolean arrays."""
+        from skimage import measure
+
+        val_min, val_max = bitmap.min(), bitmap.max()
+        binary = bitmap > (val_min + (val_max - val_min) * 0.4)
+
+        labeled = measure.label(binary)
+        regions = measure.regionprops(labeled)
+        scale_factor = 25.4 / self.dpi
+        min_area_px = self.laser_tool.pad_min_area / (scale_factor ** 2)
+
+        pad_mask = np.zeros_like(binary, dtype=bool)
+        trace_mask = np.zeros_like(binary, dtype=bool)
+
+        for region in regions:
+            if (region.area > min_area_px
+                    and region.eccentricity < self.laser_tool.pad_max_eccentricity
+                    and region.solidity > 0.7):
+                pad_mask[labeled == region.label] = True
+            else:
+                trace_mask[labeled == region.label] = True
+
+        print(f"  Detected {measure.label(pad_mask).max()} pad region(s)")
+        return pad_mask, trace_mask
+
+    def generate_pad_fills_from_mask(self, mask_bitmap: np.ndarray,
+                                     gerber_bounds: Tuple[float, float, float, float]) -> List[str]:
+        """Generate raster fill G-code directly from a solder mask Gerber bitmap.
+        Every bright region in the mask layer is a mask opening and gets filled."""
+        from skimage import measure
+
+        tool = self.laser_tool
+        scale_factor = 25.4 / self.dpi
+        gb_min_x, _, _, gb_max_y = gerber_bounds
+        fill_step_px = max(1.0, tool.fill_line_spacing / scale_factor)
+
+        val_min, val_max = mask_bitmap.min(), mask_bitmap.max()
+        binary = mask_bitmap > (val_min + (val_max - val_min) * 0.4)
+
+        labeled = measure.label(binary)
+        regions = measure.regionprops(labeled)
+        print(f"  Filling {len(regions)} mask opening(s) from solder mask layer")
+
+        gcode_lines = ["; Laser pad fill from solder mask (raster)"]
+        for region in regions:
+            min_row, _, max_row, _ = region.bbox
+            region_mask = (labeled == region.label)
+            row = float(min_row)
+            direction = 1
+            while row < max_row:
+                row_int = min(int(row), max_row - 1)
+                cols = np.where(region_mask[row_int, :])[0]
+                if len(cols) >= 2:
+                    c_s, c_e = (cols[0], cols[-1]) if direction == 1 else (cols[-1], cols[0])
+                    x_s = c_s * scale_factor + gb_min_x
+                    x_e = c_e * scale_factor + gb_min_x
+                    y = gb_max_y - row_int * scale_factor
+                    gcode_lines.append(f"G0 X{x_s:.4f} Y{y:.4f}")
+                    gcode_lines.append(f"G1 X{x_e:.4f} Y{y:.4f} S{tool.power} F{tool.feed_rate}")
+                    direction *= -1
+                row += fill_step_px
+        return gcode_lines
+
+    def generate_pad_fills(self, pad_mask: np.ndarray,
+                           gerber_bounds: Tuple[float, float, float, float]) -> List[str]:
+        """Generate boustrophedon raster fill G-code for pad regions"""
+        from skimage import measure
+
+        tool = self.laser_tool
+        scale_factor = 25.4 / self.dpi
+        gb_min_x, _, gb_max_x, gb_max_y = gerber_bounds
+        fill_step_px = max(1.0, tool.fill_line_spacing / scale_factor)
+
+        gcode_lines = ["; Laser pad fill (raster)"]
+        labeled = measure.label(pad_mask)
+        for region in measure.regionprops(labeled):
+            min_row, _, max_row, _ = region.bbox
+            region_mask = (labeled == region.label)
+            row = float(min_row)
+            direction = 1
+            while row < max_row:
+                row_int = min(int(row), max_row - 1)
+                cols = np.where(region_mask[row_int, :])[0]
+                if len(cols) >= 2:
+                    c_s, c_e = (cols[0], cols[-1]) if direction == 1 else (cols[-1], cols[0])
+                    x_s = c_s * scale_factor + gb_min_x
+                    x_e = c_e * scale_factor + gb_min_x
+                    y = gb_max_y - row_int * scale_factor
+                    gcode_lines.append(f"G0 X{x_s:.4f} Y{y:.4f}")
+                    gcode_lines.append(f"G1 X{x_e:.4f} Y{y:.4f} S{tool.power} F{tool.feed_rate}")
+                    direction *= -1
+                row += fill_step_px
+        return gcode_lines
+
+    def _pad_bitmap_to_bounds(self, bitmap: np.ndarray,
+                              gerber_bounds: Tuple[float, float, float, float],
+                              target_bounds: Tuple[float, float, float, float]
+                              ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+        """Pad a bitmap with zeros so its coordinate space extends to target_bounds.
+        Returns (padded_bitmap, new_gerber_bounds). target_bounds must be >= gerber_bounds."""
+        scale_factor = 25.4 / self.dpi
+        gb_min_x, gb_min_y, gb_max_x, gb_max_y = gerber_bounds
+        tb_min_x, tb_min_y, tb_max_x, tb_max_y = target_bounds
+
+        # Pixels to add on each side (image row 0 = Gerber max_y, so top/bottom are flipped)
+        pad_left   = max(0, round((gb_min_x - tb_min_x) / scale_factor))
+        pad_right  = max(0, round((tb_max_x - gb_max_x) / scale_factor))
+        pad_top    = max(0, round((tb_max_y - gb_max_y) / scale_factor))
+        pad_bottom = max(0, round((gb_min_y - tb_min_y) / scale_factor))
+
+        padded = np.pad(bitmap, ((pad_top, pad_bottom), (pad_left, pad_right)),
+                        mode='constant', constant_values=0)
+        new_bounds = (
+            gb_min_x - pad_left   * scale_factor,
+            gb_min_y - pad_bottom * scale_factor,
+            gb_max_x + pad_right  * scale_factor,
+            gb_max_y + pad_top    * scale_factor,
+        )
+        return padded, new_bounds
+
+    def process_laser(self, bitmap: np.ndarray,
+                      gerber_bounds: Tuple[float, float, float, float],
+                      mask_bitmap: np.ndarray = None,
+                      mask_gerber_bounds: Tuple[float, float, float, float] = None,
+                      board_bounds: Tuple[float, float, float, float] = None):
+        """Generate laser G-code for solder mask removal.
+        Returns (trace_lines, pad_lines) as separate lists for writing to separate files.
+        If mask_bitmap is provided it is used directly for pad fills using its own
+        mask_gerber_bounds; otherwise pad regions are detected heuristically from the
+        copper layer bitmap."""
+        tool = self.laser_tool
+
+        if tool.trace_border_passes > 0:
+            if board_bounds is None:
+                raise ValueError(
+                    f"trace_border_passes={tool.trace_border_passes} requires board boundary "
+                    "information, but none is available.\n"
+                    "Supply an edge cuts file (-e) or a copper traces file (-t) so a board "
+                    "boundary can be established, or set trace_border_passes to 0."
+                )
+            bitmap, gerber_bounds = self._pad_bitmap_to_bounds(
+                bitmap, gerber_bounds, board_bounds)
+            print(f"  Bitmap padded to board bounds: "
+                  f"X={board_bounds[0]:.2f}-{board_bounds[2]:.2f} mm, "
+                  f"Y={board_bounds[1]:.2f}-{board_bounds[3]:.2f} mm")
+
+        scale_factor = 25.4 / self.dpi
+        trace_lines = ["; Laser trace isolation contours"]
+        for pass_num in range(tool.trace_border_passes + 1):
+            dilation_mm = pass_num * tool.fill_line_spacing
+            dilation_px = dilation_mm / scale_factor
+            paths = self.bitmap_to_toolpaths(bitmap, gerber_bounds, erosion_px=dilation_px)
+            label = "edge" if pass_num == 0 else f"outside +{dilation_mm:.2f}mm"
+            print(f"  Trace border pass {pass_num + 1} ({label}): {len(paths)} contour(s)")
+            trace_lines.append(f"; Trace border pass {pass_num + 1} ({label})")
+            for path in paths:
+                if len(path) < 2:
+                    continue
+                x, y = path[0]
+                trace_lines.append(f"G0 X{x:.4f} Y{y:.4f}")
+                for x, y in path:
+                    trace_lines.append(f"G1 X{x:.4f} Y{y:.4f} S{tool.power} F{tool.feed_rate}")
+                trace_lines.append(f"G1 X{x:.4f} Y{y:.4f} S0")
+
+        if mask_bitmap is not None:
+            pad_bounds = mask_gerber_bounds if mask_gerber_bounds is not None else gerber_bounds
+            pad_lines = self.generate_pad_fills_from_mask(mask_bitmap, pad_bounds)
+        else:
+            pad_mask, _ = self.detect_pads_and_traces(bitmap, gerber_bounds)
+            pad_lines = self.generate_pad_fills(pad_mask, gerber_bounds) if np.any(pad_mask) else []
+
+        # Alignment mark appended to trace file so it is cut with the same
+        # tool/power settings as the trace borders.
+        if board_bounds is not None:
+            mark_x = board_bounds[0] - 3.5
+            mark_y = board_bounds[1] - 3.5
+            print(f"  Alignment mark at ({mark_x:.2f}, {mark_y:.2f})")
+            trace_lines.append("")
+            trace_lines.extend(self.generate_alignment_mark_gcode(
+                mark_x, mark_y, tool, 0, laser=True))
+
+        return trace_lines, pad_lines
+
+    def parse_edge_cuts_to_outline(self, bitmap: np.ndarray,
+                                   gerber_bounds: Tuple[float, float, float, float]
+                                   ) -> List[Tuple[float, float]]:
+        """Parse edge cuts bitmap and return board outline in absolute Gerber coordinates."""
         from skimage import measure
 
         val_min, val_max = bitmap.min(), bitmap.max()
@@ -308,8 +629,10 @@ class GerberToGcode:
         largest_contour = max(contours, key=len)
         smoothed = self.smooth_path(largest_contour, tolerance=1.0)
         scale_factor = 25.4 / self.dpi
+        gb_min_x, gb_min_y, gb_max_x, gb_max_y = gerber_bounds
 
-        outline = [(point[1] * scale_factor, point[0] * scale_factor)
+        outline = [(point[1] * scale_factor + gb_min_x,
+                    gb_max_y - point[0] * scale_factor)
                    for point in smoothed]
 
         return outline
@@ -488,7 +811,8 @@ class GerberToGcode:
 
     def convert(self, traces_file: str = None, edge_cuts_file: str = None,
                 drill_file: str = None, output_file: str = None,
-                generate_edge_cuts: str = None):
+                generate_edge_cuts: str = None, laser_layer: str = None,
+                mask_layer: str = None):
         """Main conversion process"""
 
         self.traces_file = traces_file
@@ -499,22 +823,25 @@ class GerberToGcode:
         operations = []
         gcode_sections = {}
 
-        # Process traces
+        # Phase 1: Render trace bitmap (geometry only; G-code generated after board
+        # bounds are known so the bitmap can be padded to the full board extent).
+        trace_bitmap = None
+        trace_gerber_bounds = None
         if traces_file and os.path.exists(traces_file):
             print(f"\n=== Processing traces: {traces_file} ===")
-            bitmap = self.render_gerber_to_bitmap(traces_file)
-            self.trace_bounds = self.get_trace_bounds_from_bitmap(bitmap)
+            trace_bitmap, trace_gerber_bounds = self.render_gerber_to_bitmap(traces_file)
+            self.trace_bounds = self.get_trace_bounds_from_bitmap(
+                trace_bitmap, trace_gerber_bounds)
             print(f"Trace bounds: X={self.trace_bounds[0]:.2f}-{self.trace_bounds[2]:.2f} mm, "
                   f"Y={self.trace_bounds[1]:.2f}-{self.trace_bounds[3]:.2f} mm")
 
-            gcode_sections['isolation'] = self.process_traces(bitmap)
-            operations.append('isolation')
-
-        # Process or impute edge cuts
+        # Phase 2: Determine board outline before generating isolation G-code so the
+        # trace bitmap can be padded to board bounds (ensures edge paths are complete
+        # and all layers share the same coordinate origin).
         if edge_cuts_file and os.path.exists(edge_cuts_file):
             print(f"\n=== Processing edge cuts: {edge_cuts_file} ===")
-            bitmap = self.render_gerber_to_bitmap(edge_cuts_file)
-            self.board_outline = self.parse_edge_cuts_to_outline(bitmap)
+            ec_bitmap, ec_gerber_bounds = self.render_gerber_to_bitmap(edge_cuts_file)
+            self.board_outline = self.parse_edge_cuts_to_outline(ec_bitmap, ec_gerber_bounds)
             print(f"Loaded board outline with {len(self.board_outline)} points")
         elif self.trace_bounds:
             print(f"\n=== Imputing edge cuts from trace bounds ===")
@@ -526,6 +853,19 @@ class GerberToGcode:
         # Generate edge cuts Gerber if requested
         if generate_edge_cuts and self.board_outline:
             self.generate_edge_cuts_gerber(self.board_outline, generate_edge_cuts)
+
+        # Compute board bounding box once; reused for isolation padding and laser passes.
+        board_bounds = None
+        if self.board_outline:
+            xs = [p[0] for p in self.board_outline]
+            ys = [p[1] for p in self.board_outline]
+            board_bounds = (min(xs), min(ys), max(xs), max(ys))
+
+        # Phase 3: Generate isolation G-code now that board bounds are known.
+        if trace_bitmap is not None:
+            gcode_sections['isolation'] = self.process_traces(
+                trace_bitmap, trace_gerber_bounds, board_bounds)
+            operations.append('isolation')
 
         # Add edge cuts to operations if we have an outline
         if self.board_outline:
@@ -539,6 +879,48 @@ class GerberToGcode:
             if holes:
                 gcode_sections['drill'] = self.process_drill_holes(holes)
                 operations.append('drill')
+
+        # Process laser etching layer (always written to separate files)
+        if laser_layer and os.path.exists(laser_layer):
+            print(f"\n=== Processing laser etching layer: {laser_layer} ===")
+            bitmap, gerber_bounds = self.render_gerber_to_bitmap(laser_layer)
+
+            mask_bitmap = None
+            mask_gerber_bounds = None
+            if mask_layer and os.path.exists(mask_layer):
+                print(f"  Using solder mask layer: {mask_layer}")
+                mask_bitmap, mask_gerber_bounds = self.render_gerber_to_bitmap(mask_layer)
+            elif mask_layer:
+                print(f"Warning: Solder mask file not found: {mask_layer}")
+                print("  Falling back to copper layer heuristic pad detection")
+            else:
+                print("Warning: No solder mask file provided (-m / --mask-layer).")
+                print("  Falling back to heuristic pad detection from the copper layer.")
+                print("  For best results, supply the solder mask Gerber (.gts / .gbs).")
+
+            trace_lines, pad_lines = self.process_laser(
+                bitmap, gerber_bounds, mask_bitmap, mask_gerber_bounds, board_bounds)
+            header = self.generate_laser_gcode_header(self.laser_tool)
+            footer = self.generate_laser_gcode_footer()
+
+            traces_filename = f"{self.file_prefix}_laser_traces.nc"
+            with open(traces_filename, 'w') as f:
+                f.write(header)
+                f.write('\n'.join(trace_lines))
+                f.write(footer)
+            print(f"Laser trace G-code written to {traces_filename}")
+
+            if pad_lines:
+                pads_filename = f"{self.file_prefix}_laser_pads.nc"
+                with open(pads_filename, 'w') as f:
+                    f.write(header)
+                    f.write('\n'.join(pad_lines))
+                    f.write(footer)
+                print(f"Laser pad G-code written to {pads_filename}")
+            else:
+                print("  No pads detected — skipping pad fill file")
+        elif laser_layer:
+            print(f"Warning: Laser layer file not found: {laser_layer}")
 
         # Generate output
         if self.separate_files:
@@ -626,6 +1008,10 @@ Examples:
                         help='Edge cuts Gerber file for board outline')
     parser.add_argument('-d', '--drill', type=str,
                         help='Excellon drill file (.drl, .xln)')
+    parser.add_argument('-l', '--laser-layer', type=str,
+                        help='Copper layer Gerber for laser solder mask removal (.gtl, .gbr)')
+    parser.add_argument('-m', '--mask-layer', type=str,
+                        help='Solder mask Gerber for accurate pad fill (.gts top, .gbs bottom)')
 
     # Legacy positional argument support
     parser.add_argument('input', nargs='?',
@@ -653,7 +1039,7 @@ Examples:
 
     # Handle legacy positional argument
     traces_file = args.traces or args.input
-    if not traces_file and not args.edge_cuts and not args.drill:
+    if not traces_file and not args.edge_cuts and not args.drill and not args.laser_layer and not args.mask_layer:
         parser.print_help()
         print("\nError: At least one input file is required (-t, -e, or -d)")
         sys.exit(1)
@@ -675,7 +1061,9 @@ Examples:
         edge_cuts_file=args.edge_cuts,
         drill_file=args.drill,
         output_file=args.output,
-        generate_edge_cuts=args.generate_edge_cuts
+        generate_edge_cuts=args.generate_edge_cuts,
+        laser_layer=args.laser_layer,
+        mask_layer=args.mask_layer
     )
 
 
