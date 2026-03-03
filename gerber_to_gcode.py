@@ -61,6 +61,10 @@ class ToolPreset:
         self.trace_border_passes = config.get('trace_border_passes', 0)
         self.pad_min_area = config.get('pad_min_area', 1.0)
         self.pad_max_eccentricity = config.get('pad_max_eccentricity', 0.8)
+        # Pad ablation can use lower power / higher speed than trace isolation.
+        # Falls back to the main laser power/feed_rate if not set.
+        self.pad_power = config.get('pad_power', self.power)
+        self.pad_feed_rate = config.get('pad_feed_rate', self.feed_rate)
 
 
 class GerberToGcode:
@@ -78,6 +82,14 @@ class GerberToGcode:
         self.edge_cuts_tool = ToolPreset(tools_config.get('edge_cuts', {}))
         self.drill_tool = ToolPreset(tools_config.get('drill', {}))
         self.laser_tool = ToolPreset(tools_config.get('laser', {}))
+        # Back isolation defaults to the same settings as isolation if not separately configured
+        back_iso_config = tools_config.get('back_isolation', tools_config.get('isolation', {}))
+        self.back_isolation_tool = ToolPreset(back_iso_config)
+
+        # Soldermask overlay settings
+        sm_config = self.config.get('soldermask_overlay', {})
+        self.soldermask_print_dpi = sm_config.get('print_dpi', 600)
+        self.soldermask_invert = sm_config.get('invert', True)
 
         # File paths
         self.traces_file = None
@@ -274,7 +286,7 @@ class GerberToGcode:
 
         if erosion_px > 0:
             disk_r = max(1, round(erosion_px))
-            binary = morphology.binary_dilation(binary, morphology.disk(disk_r))
+            binary = morphology.dilation(binary, morphology.disk(disk_r))
 
         pad_size = 2
         binary = np.pad(binary, pad_size, mode='constant', constant_values=False)
@@ -351,6 +363,79 @@ class GerberToGcode:
             lines.append(f"G3 X{cx - r:.4f} Y{cy:.4f} I{r:.4f} J0 F{feed}")
             lines.append(f"G0 Z{safe_h}")
 
+        return lines
+
+    def generate_soldermask_png(self, mask_file: str, output_path: str):
+        """Render solder mask Gerber to a printable PNG sized for physical printing.
+
+        The PNG has embedded DPI metadata so printing at 100% scale produces the
+        correct physical board size.  By default the image is inverted so that pad
+        openings are dark (positive photoemulsion process: UV is blocked over pads,
+        emulsion washes away there, leaving bare copper exposed).
+        """
+        from io import BytesIO
+
+        print_dpi = self.soldermask_print_dpi
+        invert = self.soldermask_invert
+
+        try:
+            gf = GerberFile.from_file(mask_file, file_type=FileTypeEnum.INFER_FROM_EXTENSION)
+            parsed_file = gf.parse()
+
+            info = parsed_file.get_info()
+            bounds = (
+                float(info.min_x_mm), float(info.min_y_mm),
+                float(info.max_x_mm), float(info.max_y_mm),
+            )
+            width_mm = bounds[2] - bounds[0]
+            height_mm = bounds[3] - bounds[1]
+
+            dpmm = int(print_dpi / 25.4)
+            buffer = BytesIO()
+            parsed_file.render_raster(
+                destination=buffer,
+                dpmm=dpmm,
+                pixel_format=PixelFormatEnum.RGBA,
+                image_format=ImageFormatEnum.PNG,
+            )
+            buffer.seek(0)
+            img = Image.open(buffer).convert('L')
+
+            if invert:
+                img = Image.fromarray(255 - np.array(img))
+
+            img.save(output_path, dpi=(print_dpi, print_dpi))
+            print(f"  Physical size: {width_mm:.2f} x {height_mm:.2f} mm "
+                  f"({img.width} x {img.height} px @ {print_dpi} DPI)")
+            print(f"  {'Inverted — positive photoemulsion (dark pads)' if invert else 'Not inverted — negative photoemulsion (clear pads)'}")
+            print(f"  Soldermask PNG written to: {output_path}")
+
+        except Exception as e:
+            print(f"Error generating soldermask PNG: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def process_back_traces(self, bitmap: np.ndarray,
+                            gerber_bounds: Tuple[float, float, float, float],
+                            board_bounds: Tuple[float, float, float, float] = None) -> List[str]:
+        """Generate isolation G-code for the back copper layer (ground plane / back traces).
+
+        The bitmap is mirrored horizontally to account for physically flipping the board
+        left-to-right before milling the back side.  X coordinates in the output G-code
+        therefore correspond to the correct machine positions when the board is flipped.
+        Tool settings come from the back_isolation_tool (defaults to isolation settings).
+        """
+        mirrored = np.fliplr(bitmap)
+
+        # Temporarily swap to the back isolation tool so process_traces uses its settings
+        saved_tool = self.isolation_tool
+        self.isolation_tool = self.back_isolation_tool
+        try:
+            lines = self.process_traces(mirrored, gerber_bounds, board_bounds)
+        finally:
+            self.isolation_tool = saved_tool
+
+        lines.insert(0, "; Back copper isolation — board mirrored for back-side milling")
         return lines
 
     def process_traces(self, bitmap: np.ndarray,
@@ -486,7 +571,7 @@ class GerberToGcode:
                     x_e = c_e * scale_factor + gb_min_x
                     y = gb_max_y - row_int * scale_factor
                     gcode_lines.append(f"G0 X{x_s:.4f} Y{y:.4f}")
-                    gcode_lines.append(f"G1 X{x_e:.4f} Y{y:.4f} S{tool.power} F{tool.feed_rate}")
+                    gcode_lines.append(f"G1 X{x_e:.4f} Y{y:.4f} S{tool.pad_power} F{tool.pad_feed_rate}")
                     direction *= -1
                 row += fill_step_px
         return gcode_lines
@@ -517,7 +602,7 @@ class GerberToGcode:
                     x_e = c_e * scale_factor + gb_min_x
                     y = gb_max_y - row_int * scale_factor
                     gcode_lines.append(f"G0 X{x_s:.4f} Y{y:.4f}")
-                    gcode_lines.append(f"G1 X{x_e:.4f} Y{y:.4f} S{tool.power} F{tool.feed_rate}")
+                    gcode_lines.append(f"G1 X{x_e:.4f} Y{y:.4f} S{tool.pad_power} F{tool.pad_feed_rate}")
                     direction *= -1
                 row += fill_step_px
         return gcode_lines
@@ -812,7 +897,8 @@ class GerberToGcode:
     def convert(self, traces_file: str = None, edge_cuts_file: str = None,
                 drill_file: str = None, output_file: str = None,
                 generate_edge_cuts: str = None, laser_layer: str = None,
-                mask_layer: str = None):
+                mask_layer: str = None, back_traces_file: str = None,
+                soldermask_png: str = None):
         """Main conversion process"""
 
         self.traces_file = traces_file
@@ -922,6 +1008,32 @@ class GerberToGcode:
         elif laser_layer:
             print(f"Warning: Laser layer file not found: {laser_layer}")
 
+        # Generate soldermask overlay PNG for photoemulsion printing
+        if soldermask_png:
+            if mask_layer and os.path.exists(mask_layer):
+                print(f"\n=== Generating soldermask overlay PNG ===")
+                self.generate_soldermask_png(mask_layer, soldermask_png)
+            elif mask_layer:
+                print(f"Warning: Mask layer file not found: {mask_layer}")
+                print("  Skipping soldermask PNG generation")
+            else:
+                print("Warning: --soldermask-png requires --mask-layer (-m) to be specified")
+
+        # Process back copper layer (ground plane / double-sided PCB back traces)
+        if back_traces_file and os.path.exists(back_traces_file):
+            print(f"\n=== Processing back copper layer: {back_traces_file} ===")
+            back_bitmap, back_gerber_bounds = self.render_gerber_to_bitmap(back_traces_file)
+            back_lines = self.process_back_traces(back_bitmap, back_gerber_bounds, board_bounds)
+
+            back_filename = f"{self.file_prefix}_back_isolation.nc"
+            with open(back_filename, 'w') as f:
+                f.write(self.generate_gcode_header('back_isolation', self.back_isolation_tool))
+                f.write('\n'.join(back_lines))
+                f.write(self.generate_gcode_footer())
+            print(f"Back isolation G-code written to {back_filename}")
+        elif back_traces_file:
+            print(f"Warning: Back traces file not found: {back_traces_file}")
+
         # Generate output
         if self.separate_files:
             self._write_separate_files(gcode_sections)
@@ -998,6 +1110,12 @@ Examples:
 
   # Generate separate files for each operation
   %(prog)s -t traces.gbr -e edges.gbr --separate
+
+  # Double-sided PCB: top isolation + back copper ground plane
+  %(prog)s -t front.gtl -b back.gbl -e edges.gbr -o front.nc
+
+  # Soldermask overlay PNG for photoemulsion printing
+  %(prog)s -m board.gts --soldermask-png soldermask_top.png
         """
     )
 
@@ -1012,6 +1130,8 @@ Examples:
                         help='Copper layer Gerber for laser solder mask removal (.gtl, .gbr)')
     parser.add_argument('-m', '--mask-layer', type=str,
                         help='Solder mask Gerber for accurate pad fill (.gts top, .gbs bottom)')
+    parser.add_argument('-b', '--back-traces', type=str,
+                        help='Back copper Gerber for double-sided ground plane isolation (.gbl, .gbr)')
 
     # Legacy positional argument support
     parser.add_argument('input', nargs='?',
@@ -1034,12 +1154,16 @@ Examples:
                         help='Override edge margin for imputed board outline (mm)')
     parser.add_argument('--dpi', type=int,
                         help='Override DPI for Gerber rendering')
+    parser.add_argument('--soldermask-png', type=str,
+                        help='Output PNG file for soldermask overlay (requires -m; for photoemulsion printing)')
+    parser.add_argument('--print-dpi', type=int,
+                        help='Override print DPI for soldermask PNG (default from config, typically 600)')
 
     args = parser.parse_args()
 
     # Handle legacy positional argument
     traces_file = args.traces or args.input
-    if not traces_file and not args.edge_cuts and not args.drill and not args.laser_layer and not args.mask_layer:
+    if not traces_file and not args.edge_cuts and not args.drill and not args.laser_layer and not args.mask_layer and not args.back_traces:
         parser.print_help()
         print("\nError: At least one input file is required (-t, -e, or -d)")
         sys.exit(1)
@@ -1054,6 +1178,8 @@ Examples:
         converter.dpi = args.dpi
     if args.separate:
         converter.separate_files = True
+    if args.print_dpi is not None:
+        converter.soldermask_print_dpi = args.print_dpi
 
     # Run conversion
     converter.convert(
@@ -1063,7 +1189,9 @@ Examples:
         output_file=args.output,
         generate_edge_cuts=args.generate_edge_cuts,
         laser_layer=args.laser_layer,
-        mask_layer=args.mask_layer
+        mask_layer=args.mask_layer,
+        back_traces_file=args.back_traces,
+        soldermask_png=args.soldermask_png,
     )
 
 
