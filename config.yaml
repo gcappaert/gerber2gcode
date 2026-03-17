@@ -38,7 +38,7 @@ tools:
     feed_rate: 100        # mm/min - not used for drilling
     plunge_rate: 60       # mm/min - drilling feed
     cut_depth: 0.3       # mm - peck depth (0 for single plunge)
-    total_depth: 1.54      # mm - drill through depth
+    total_depth: 1.8      # mm - drill through depth
     retract_height: 1.0   # mm - retract between pecks
 
   # Back copper layer isolation (for double-sided PCBs / ground plane)

@@ -100,6 +100,9 @@ class GerberToGcode:
         # Processed data
         self.trace_bounds = None
         self.board_outline = None
+        # Coordinate offset applied to all G-code output so the board's lower-left
+        # corner (= front alignment mark) maps to machine (0, 0).
+        self._coord_offset = (0.0, 0.0)
 
     def load_config(self, config_file: Optional[str]) -> Dict:
         """Load configuration from YAML file or return defaults"""
@@ -298,17 +301,24 @@ class GerberToGcode:
         contours = measure.find_contours(binary.astype(float), 0.5)
         contours = [contour - pad_size for contour in contours]
 
-        scale_factor = 25.4 / self.dpi
         smooth_tolerance = max(0.5, self.dpi / 2000)
         gb_min_x, gb_min_y, gb_max_x, gb_max_y = gerber_bounds
 
+        # Derive pixel size from actual bitmap dimensions (node-centered: pixel 0 is at
+        # gb_min, pixel W-1 is at gb_max).  This avoids the ~0.5 mm systematic error that
+        # arises from using 25.4/dpi when the renderer uses int(dpi/25.4) pixels/mm.
+        W, H = bitmap.shape[1], bitmap.shape[0]
+        scale_x = (gb_max_x - gb_min_x) / (W - 1) if W > 1 else (25.4 / self.dpi)
+        scale_y = (gb_max_y - gb_min_y) / (H - 1) if H > 1 else (25.4 / self.dpi)
+
+        x_off, y_off = self._coord_offset
         paths = []
         for contour in contours:
             smoothed = self.smooth_path(contour, tolerance=smooth_tolerance)
             # point[1] = column = X, point[0] = row = Y
             # Y-axis flipped: bitmap row 0 = top = max Y in Gerber
-            path = [(point[1] * scale_factor + gb_min_x,
-                     gb_max_y - point[0] * scale_factor)
+            path = [(point[1] * scale_x + gb_min_x + x_off,
+                     gb_max_y - point[0] * scale_y + y_off)
                     for point in smoothed]
             if len(path) >= 2:
                 paths.append(path)
@@ -317,15 +327,16 @@ class GerberToGcode:
 
     def generate_alignment_mark_gcode(self, cx: float, cy: float,
                                        tool, cut_depth: float,
-                                       laser: bool = False) -> List[str]:
-        """Generate G-code for an alignment mark: X crosshair inside a 4mm circle.
+                                       laser: bool = False,
+                                       with_drill_hole: bool = False) -> List[str]:
+        """Generate G-code for an alignment mark: X crosshair inside a 3mm circle.
         cx, cy is the mark centre in absolute coordinates.
         For milling, cut_depth is the Z plunge depth (positive mm).
         For laser, laser=True omits Z moves and uses S power instead."""
-        r = 2.0                    # circle radius → 4mm diameter (≤5mm limit)
+        r = 1.5                    # circle radius → 3mm diameter (≤5mm limit)
         arm = r / (2 ** 0.5)      # arm half-length so endpoints touch the circle
 
-        lines = [f"; Alignment mark  centre=({cx:.3f},{cy:.3f})  diam=4mm"]
+        lines = [f"; Alignment mark  centre=({cx:.3f},{cy:.3f})  diam=3mm"]
 
         if laser:
             power = tool.power
@@ -362,6 +373,24 @@ class GerberToGcode:
             lines.append(f"G1 Z{depth:.4f} F{plunge}")
             lines.append(f"G3 X{cx - r:.4f} Y{cy:.4f} I{r:.4f} J0 F{feed}")
             lines.append(f"G0 Z{safe_h}")
+
+            if with_drill_hole:
+                drill = self.drill_tool
+                lines.append(f"; Alignment drill hole at centre — change to {drill.tool_diameter:.2f} mm drill bit")
+                lines.extend(self.generate_tool_change(
+                    f"alignment drill ({drill.tool_diameter:.2f} mm)", drill))
+                lines.append(f"G0 X{cx:.4f} Y{cy:.4f} Z{self.safe_height}")
+                if drill.cut_depth > 0 and drill.cut_depth < drill.total_depth:
+                    # Peck drilling
+                    current_depth = 0.0
+                    while current_depth < drill.total_depth:
+                        current_depth = min(current_depth + drill.cut_depth, drill.total_depth)
+                        lines.append(f"G1 Z{-current_depth:.4f} F{drill.plunge_rate}")
+                        lines.append(f"G0 Z{drill.retract_height}")
+                    lines.append(f"G0 Z{self.safe_height}")
+                else:
+                    lines.append(f"G1 Z{-drill.total_depth:.4f} F{drill.plunge_rate}")
+                    lines.append(f"G0 Z{self.safe_height}")
 
         return lines
 
@@ -401,12 +430,20 @@ class GerberToGcode:
             buffer.seek(0)
             img = Image.open(buffer).convert('L')
 
+            # Binarize before inversion: drawn areas (bright) → 255, background/transparent → 0
+            arr = np.where(np.array(img) > 64, 255, 0).astype(np.uint8)
             if invert:
-                img = Image.fromarray(255 - np.array(img))
+                arr = 255 - arr
+            img = Image.fromarray(arr)
 
-            img.save(output_path, dpi=(print_dpi, print_dpi))
+            # Save at the actual rendered DPI (dpmm * 25.4), not the requested print_dpi.
+            # int(print_dpi / 25.4) truncates, so the rendered pixel density is slightly
+            # different from print_dpi; using the actual value prevents a systematic
+            # scale error of up to ~2.6% (≈1 mm over a 40 mm board at 600 DPI).
+            actual_dpi = dpmm * 25.4
+            img.save(output_path, dpi=(actual_dpi, actual_dpi))
             print(f"  Physical size: {width_mm:.2f} x {height_mm:.2f} mm "
-                  f"({img.width} x {img.height} px @ {print_dpi} DPI)")
+                  f"({img.width} x {img.height} px @ {actual_dpi:.1f} DPI)")
             print(f"  {'Inverted — positive photoemulsion (dark pads)' if invert else 'Not inverted — negative photoemulsion (clear pads)'}")
             print(f"  Soldermask PNG written to: {output_path}")
 
@@ -425,33 +462,106 @@ class GerberToGcode:
         therefore correspond to the correct machine positions when the board is flipped.
         Tool settings come from the back_isolation_tool (defaults to isolation settings).
         """
+        lines = ["; Back copper isolation — board mirrored for back-side milling"]
+
+        # Pad to board bounds BEFORE flipping.  If we flip first, the left/right sides
+        # are swapped, so _pad_bitmap_to_bounds would add padding to the wrong sides.
+        if board_bounds is not None:
+            bitmap, _ = self._pad_bitmap_to_bounds(bitmap, gerber_bounds, board_bounds)
+            gerber_bounds = board_bounds  # Force exact match — process_traces adds zero secondary padding
+
         mirrored = np.fliplr(bitmap)
 
-        # Temporarily swap to the back isolation tool so process_traces uses its settings
+        # Alignment marks and verification pause BEFORE back-side isolation traces.
+        # After flipping the board left-right, set machine origin at the (W,0) drill hole
+        # (now the lower-left).  The marks below should then land on the two bottom holes.
+        if board_bounds is not None:
+            x_off, y_off = self._coord_offset
+            mark_a_x = board_bounds[0] + x_off   # = 0.0  (lower-left after flip = old lower-right hole)
+            mark_a_y = board_bounds[1] + y_off   # = 0.0
+            mark_b_x = board_bounds[2] + x_off   # = board_width (lower-right after flip = old lower-left hole)
+            mark_b_y = mark_a_y
+            print(f"  Back alignment mark A at ({mark_a_x:.2f}, {mark_a_y:.2f})")
+            print(f"  Back alignment mark B at ({mark_b_x:.2f}, {mark_b_y:.2f})")
+            lines.append("; === ALIGNMENT MARKS — milled before isolation, verify against drill holes ===")
+            lines.append(f"; Mark A at ({mark_a_x:.3f}, {mark_a_y:.3f}) — lower-left (old lower-right drill hole)")
+            lines.extend(self.generate_alignment_mark_gcode(
+                mark_a_x, mark_a_y, self.back_isolation_tool,
+                self.back_isolation_tool.cut_depth, laser=False, with_drill_hole=False))
+            lines.append("")
+            lines.append(f"; Mark B at ({mark_b_x:.3f}, {mark_b_y:.3f}) — lower-right (old lower-left drill hole)")
+            lines.extend(self.generate_alignment_mark_gcode(
+                mark_b_x, mark_b_y, self.back_isolation_tool,
+                self.back_isolation_tool.cut_depth, laser=False, with_drill_hole=False))
+            lines.append("")
+            lines.append("; === PAUSE — inspect alignment marks vs drill holes, then resume ===")
+            lines.append(f"G0 Z{self.safe_height}    ; Raise to safe height")
+            lines.append("M5          ; Stop spindle")
+            lines.append("M0          ; ** INSPECT: marks should be centred on drill holes — resume to mill traces **")
+            lines.append(f"M3 S{self.back_isolation_tool.spindle_speed}  ; Restart spindle")
+            lines.append("G4 P2       ; Dwell for spindle")
+            lines.append("")
+
+        # Generate isolation toolpaths using back isolation tool settings.
         saved_tool = self.isolation_tool
         self.isolation_tool = self.back_isolation_tool
         try:
-            lines = self.process_traces(mirrored, gerber_bounds, board_bounds)
+            isolation_lines = self.process_traces(mirrored, gerber_bounds, board_bounds,
+                                                  add_alignment_mark=False)
         finally:
             self.isolation_tool = saved_tool
 
-        lines.insert(0, "; Back copper isolation — board mirrored for back-side milling")
+        lines.extend(isolation_lines)
         return lines
 
     def process_traces(self, bitmap: np.ndarray,
                        gerber_bounds: Tuple[float, float, float, float],
-                       board_bounds: Tuple[float, float, float, float] = None) -> List[str]:
-        """Generate G-code for isolation routing of traces"""
+                       board_bounds: Tuple[float, float, float, float] = None,
+                       add_alignment_mark: bool = True) -> List[str]:
+        """Generate G-code for isolation routing of traces.
+
+        When add_alignment_mark=True (front side), two alignment marks are milled at
+        (0,0) and (board_width,0) BEFORE the isolation traces, followed by an M0 pause
+        so the operator can verify alignment against the drill holes before milling starts.
+        """
         tool = self.isolation_tool
         gcode_lines = ["; Isolation routing"]
 
         scale_factor = 25.4 / self.dpi
 
+        # Alignment marks and verification pause BEFORE isolation traces (front side only).
+        # The operator checks that the milled marks land on the drilled alignment holes;
+        # if they do, the board is correctly registered and milling can proceed.
+        if add_alignment_mark and board_bounds is not None:
+            x_off, y_off = self._coord_offset
+            mark_a_x = board_bounds[0] + x_off   # = 0.0
+            mark_a_y = board_bounds[1] + y_off   # = 0.0
+            mark_b_x = board_bounds[2] + x_off   # = board_width
+            mark_b_y = mark_a_y
+            print(f"  Alignment mark A at ({mark_a_x:.2f}, {mark_a_y:.2f})  [lower-left]")
+            print(f"  Alignment mark B at ({mark_b_x:.2f}, {mark_b_y:.2f})  [lower-right, {mark_b_x - mark_a_x:.2f} mm]")
+            gcode_lines.append("; === ALIGNMENT MARKS — milled before isolation, centres match drill holes ===")
+            gcode_lines.append(f"; Mark A at ({mark_a_x:.3f}, {mark_a_y:.3f}) — lower-left drill hole")
+            gcode_lines.extend(self.generate_alignment_mark_gcode(
+                mark_a_x, mark_a_y, tool, tool.cut_depth, laser=False, with_drill_hole=False))
+            gcode_lines.append("")
+            gcode_lines.append(f"; Mark B at ({mark_b_x:.3f}, {mark_b_y:.3f}) — lower-right drill hole")
+            gcode_lines.extend(self.generate_alignment_mark_gcode(
+                mark_b_x, mark_b_y, tool, tool.cut_depth, laser=False, with_drill_hole=False))
+            gcode_lines.append("")
+            gcode_lines.append("; === PAUSE — inspect alignment marks vs drill holes, then resume ===")
+            gcode_lines.append(f"G0 Z{self.safe_height}    ; Raise to safe height")
+            gcode_lines.append("M5          ; Stop spindle")
+            gcode_lines.append("M0          ; ** INSPECT: marks should be centred on drill holes — resume to mill traces **")
+            gcode_lines.append(f"M3 S{tool.spindle_speed}  ; Restart spindle")
+            gcode_lines.append("G4 P2       ; Dwell for spindle")
+            gcode_lines.append("")
+
         # Pad bitmap to board bounds so traces at the edges of the copper region
         # get fully closed contours and coordinates align with edge cuts / drill layers.
         if board_bounds is not None:
-            bitmap, gerber_bounds = self._pad_bitmap_to_bounds(
-                bitmap, gerber_bounds, board_bounds)
+            bitmap, _ = self._pad_bitmap_to_bounds(bitmap, gerber_bounds, board_bounds)
+            gerber_bounds = board_bounds  # Force exact bounds so both sides share the same origin
             print(f"  Bitmap padded to board bounds: "
                   f"X={board_bounds[0]:.2f}-{board_bounds[2]:.2f} mm, "
                   f"Y={board_bounds[1]:.2f}-{board_bounds[3]:.2f} mm")
@@ -479,17 +589,6 @@ class GerberToGcode:
                     gcode_lines.append(f"G1 X{x:.4f} Y{y:.4f} F{tool.feed_rate}")
                 gcode_lines.append(f"G0 Z{self.safe_height}")
 
-            gcode_lines.append("")
-
-        # Alignment mark: X-in-circle, 4mm diameter, cut at trace depth.
-        # Placed 3.5mm outside the bottom-left board corner so it sits in
-        # waste material and does not interfere with the board outline.
-        if board_bounds is not None:
-            mark_x = board_bounds[0] - 3.5
-            mark_y = board_bounds[1] - 3.5
-            print(f"  Alignment mark at ({mark_x:.2f}, {mark_y:.2f})")
-            gcode_lines.extend(self.generate_alignment_mark_gcode(
-                mark_x, mark_y, tool, tool.cut_depth, laser=False))
             gcode_lines.append("")
 
         return gcode_lines
@@ -687,8 +786,9 @@ class GerberToGcode:
         # Alignment mark appended to trace file so it is cut with the same
         # tool/power settings as the trace borders.
         if board_bounds is not None:
-            mark_x = board_bounds[0] - 3.5
-            mark_y = board_bounds[1] - 3.5
+            x_off, y_off = self._coord_offset
+            mark_x = board_bounds[0] + x_off - 3.5   # = -3.5 (outside board lower-left)
+            mark_y = board_bounds[1] + y_off - 3.5   # = -3.5
             print(f"  Alignment mark at ({mark_x:.2f}, {mark_y:.2f})")
             trace_lines.append("")
             trace_lines.extend(self.generate_alignment_mark_gcode(
@@ -749,17 +849,18 @@ class GerberToGcode:
         ]
 
         passes_needed = max(1, int(np.ceil(tool.total_depth / tool.cut_depth)))
+        x_off, y_off = self._coord_offset
 
         for pass_num in range(passes_needed):
             current_depth = min((pass_num + 1) * tool.cut_depth, tool.total_depth)
             gcode_lines.append(f"; Cutout pass {pass_num + 1} (depth: {current_depth:.2f} mm)")
 
             x, y = outline[0]
-            gcode_lines.append(f"G0 X{x:.4f} Y{y:.4f} Z{self.safe_height}")
+            gcode_lines.append(f"G0 X{x + x_off:.4f} Y{y + y_off:.4f} Z{self.safe_height}")
             gcode_lines.append(f"G1 Z{-current_depth:.4f} F{tool.plunge_rate}")
 
             for x, y in outline[1:]:
-                gcode_lines.append(f"G1 X{x:.4f} Y{y:.4f} F{tool.feed_rate}")
+                gcode_lines.append(f"G1 X{x + x_off:.4f} Y{y + y_off:.4f} F{tool.feed_rate}")
 
             gcode_lines.append(f"G0 Z{self.safe_height}")
 
@@ -826,42 +927,67 @@ class GerberToGcode:
             print(f"Error parsing drill file: {e}")
             return []
 
-    def process_drill_holes(self, holes: List[Tuple[float, float, float]]) -> List[str]:
-        """Generate G-code for drilling holes"""
-        if not holes:
-            return []
+    def process_drill_holes(self, holes: List[Tuple[float, float, float]],
+                            board_bounds: Tuple[float, float, float, float] = None) -> List[str]:
+        """Generate G-code for drilling holes.
 
+        If board_bounds is provided, three alignment holes are drilled first at the board
+        corners (0,0), (W,0), and (W,H) so the board can be precisely re-homed when
+        flipped for back-side milling.
+        """
         tool = self.drill_tool
         gcode_lines = [
             "; Drilling",
             f"; Total depth: {tool.total_depth} mm",
+            "",
         ]
 
-        # Group holes by diameter for efficiency
-        holes_by_diameter = {}
+        def _drill_at(gx: float, gy: float) -> List[str]:
+            cmds = [f"G0 X{gx:.4f} Y{gy:.4f} Z{self.safe_height}"]
+            if tool.cut_depth > 0 and tool.cut_depth < tool.total_depth:
+                current_depth = 0.0
+                while current_depth < tool.total_depth:
+                    current_depth = min(current_depth + tool.cut_depth, tool.total_depth)
+                    cmds.append(f"G1 Z{-current_depth:.4f} F{tool.plunge_rate}")
+                    cmds.append(f"G0 Z{tool.retract_height}")
+                cmds.append(f"G0 Z{self.safe_height}")
+            else:
+                cmds.append(f"G1 Z{-tool.total_depth:.4f} F{tool.plunge_rate}")
+                cmds.append(f"G0 Z{self.safe_height}")
+            return cmds
+
+        # Alignment holes at board corners — drilled before PCB holes so the user
+        # can immediately verify position.  Three non-collinear corners fully constrain
+        # translation AND rotation; (0,0), (W,0), and (W,H) form an L along the bottom
+        # and right edge, matching the flip workflow.
+        if board_bounds is not None:
+            x_off, y_off = self._coord_offset
+            corners = [
+                (board_bounds[0] + x_off, board_bounds[1] + y_off),  # (0, 0)  lower-left
+                (board_bounds[2] + x_off, board_bounds[1] + y_off),  # (W, 0)  lower-right
+                (board_bounds[2] + x_off, board_bounds[3] + y_off),  # (W, H)  upper-right
+            ]
+            labels = ["(0,0) lower-left", "(W,0) lower-right", "(W,H) upper-right"]
+            gcode_lines.append("; === ALIGNMENT HOLES — drill before flipping, used for front/back registration ===")
+            for (ax, ay), lbl in zip(corners, labels):
+                gcode_lines.append(f"; Alignment hole {lbl}")
+                gcode_lines.extend(_drill_at(ax, ay))
+            gcode_lines.append("; === END ALIGNMENT HOLES ===")
+            gcode_lines.append("")
+
+        if not holes:
+            return gcode_lines
+
+        # Group PCB holes by diameter for efficient tool changes
+        holes_by_diameter: Dict[float, List[Tuple[float, float]]] = {}
         for x, y, d in holes:
-            if d not in holes_by_diameter:
-                holes_by_diameter[d] = []
-            holes_by_diameter[d].append((x, y))
+            holes_by_diameter.setdefault(d, []).append((x, y))
 
+        x_off, y_off = self._coord_offset
         for diameter, hole_list in sorted(holes_by_diameter.items()):
-            gcode_lines.append(f"; Holes: {diameter:.2f} mm diameter ({len(hole_list)} holes)")
-
+            gcode_lines.append(f"; PCB holes: {diameter:.2f} mm diameter ({len(hole_list)} holes)")
             for x, y in hole_list:
-                gcode_lines.append(f"G0 X{x:.4f} Y{y:.4f} Z{self.safe_height}")
-
-                if tool.cut_depth > 0 and tool.cut_depth < tool.total_depth:
-                    # Peck drilling
-                    current_depth = 0
-                    while current_depth < tool.total_depth:
-                        current_depth = min(current_depth + tool.cut_depth, tool.total_depth)
-                        gcode_lines.append(f"G1 Z{-current_depth:.4f} F{tool.plunge_rate}")
-                        gcode_lines.append(f"G0 Z{tool.retract_height}")
-                    gcode_lines.append(f"G0 Z{self.safe_height}")
-                else:
-                    # Single plunge
-                    gcode_lines.append(f"G1 Z{-tool.total_depth:.4f} F{tool.plunge_rate}")
-                    gcode_lines.append(f"G0 Z{self.safe_height}")
+                gcode_lines.extend(_drill_at(x + x_off, y + y_off))
 
         return gcode_lines
 
@@ -946,6 +1072,11 @@ class GerberToGcode:
             xs = [p[0] for p in self.board_outline]
             ys = [p[1] for p in self.board_outline]
             board_bounds = (min(xs), min(ys), max(xs), max(ys))
+            # Shift all G-code output so the board's lower-left corner (front alignment
+            # mark) is at machine (0, 0), regardless of Gerber file coordinate origin.
+            self._coord_offset = (-board_bounds[0], -board_bounds[1])
+        else:
+            self._coord_offset = (0.0, 0.0)
 
         # Phase 3: Generate isolation G-code now that board bounds are known.
         if trace_bitmap is not None:
@@ -958,12 +1089,15 @@ class GerberToGcode:
             gcode_sections['edge_cuts'] = self.process_edge_cuts(self.board_outline)
             operations.append('edge_cuts')
 
-        # Process drill file
+        # Process drill file (alignment holes are added even if no PCB holes)
+        holes = []
         if drill_file and os.path.exists(drill_file):
             print(f"\n=== Processing drill file: {drill_file} ===")
             holes = self.parse_drill_file(drill_file)
-            if holes:
-                gcode_sections['drill'] = self.process_drill_holes(holes)
+        if holes or board_bounds is not None:
+            drill_lines = self.process_drill_holes(holes, board_bounds)
+            if drill_lines:
+                gcode_sections['drill'] = drill_lines
                 operations.append('drill')
 
         # Process laser etching layer (always written to separate files)
