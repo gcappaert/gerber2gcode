@@ -111,6 +111,20 @@ python gerber_to_gcode.py -t front.gtl -b back.gbl -e edges.gm1 --separate
 
 The back copper bitmap is horizontally mirrored to compensate for physically flipping the board.
 
+### Cut Depth Test Pattern
+
+Generates a set of straight test lines at increasing depths (default 0.06–0.14 mm in 0.02 mm steps), cut with the isolation tool settings. Use it to find the depth that cleanly isolates copper on your board.
+
+```bash
+# Default range from config.yaml -> depth_test.nc
+python gerber_to_gcode.py --depth-test
+
+# Custom output file and range
+python gerber_to_gcode.py --depth-test test.nc --depth-min 0.04 --depth-max 0.10 --depth-step 0.01
+```
+
+Set machine X0 Y0 at the lower-left of a scrap area with Z0 on the copper surface. Lines are stacked along +Y (`line_spacing`, default 2 mm), shallowest at Y=0 and deepest at the top. Defaults are set in the `depth_test` section of `config.yaml`.
+
 ### Using a Configuration File
 
 ```bash
@@ -144,6 +158,8 @@ python gerber_to_gcode.py -t traces.gtl --config my_settings.yaml
 | `--generate-edge-cuts` | Output file for generated edge cuts Gerber |
 | `--soldermask-png` | Output PNG for soldermask overlay (requires `-m`) |
 | `--print-dpi` | Override print DPI for soldermask PNG (default from config, typically 600) |
+| `--depth-test [FILE]` | Generate a cut depth test pattern (default file: `depth_test.nc`); needs no Gerber input |
+| `--depth-min`, `--depth-max`, `--depth-step` | Override the depth test range/step (mm) |
 
 ### Configuration
 

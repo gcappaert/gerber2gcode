@@ -67,6 +67,14 @@ tools:
     pad_power: 400          # S value for pad ablation (omit to use main power)
     pad_feed_rate: 500      # mm/min for pad ablation (omit to use main feed_rate)
 
+# Cut depth test pattern (--depth-test), cut with the isolation tool settings above
+depth_test:
+  min_depth: 0.06         # mm - shallowest line
+  max_depth: 0.14         # mm - deepest line
+  depth_step: 0.02        # mm - depth increase between lines
+  line_length: 10.0       # mm - length of each test line (X)
+  line_spacing: 2.0       # mm - distance between lines (Y)
+
 # Soldermask overlay for photoemulsion printing
 # Used with --soldermask-png to generate a printable transparency for soldermask application
 soldermask_overlay:
