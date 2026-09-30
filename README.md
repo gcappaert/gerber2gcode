@@ -145,7 +145,7 @@ The same setting controls the **alignment drill holes**: a hole is drilled at ea
 
 ### Cut Depth Test Pattern
 
-Generates a set of straight test lines at increasing depths (default 0.06–0.14 mm in 0.02 mm steps), cut with the isolation tool settings. Use it to find the depth that cleanly isolates copper on your board.
+Generates test cuts at increasing depths (default 0.06–0.14 mm in 0.02 mm steps), cut with the isolation tool settings. Each depth is a group of 3 parallel lines spaced by the step-over value, so you can find both the depth that cleanly isolates copper and whether adjacent passes overlap properly at that depth.
 
 ```bash
 # Default range from config.yaml -> depth_test.nc
@@ -155,7 +155,7 @@ python gerber_to_gcode.py --depth-test
 python gerber_to_gcode.py --depth-test test.nc --depth-min 0.04 --depth-max 0.10 --depth-step 0.01
 ```
 
-Set machine X0 Y0 at the lower-left of a scrap area with Z0 on the copper surface. Lines are stacked along +Y (`line_spacing`, default 2 mm), shallowest at Y=0 and deepest at the top. The depth is also milled as a two-digit label to the right of each line, in hundredths of a mm (`06` = 0.06 mm, `14` = 0.14 mm), cut at that line's depth. Defaults are set in the `depth_test` section of `config.yaml`; set `label_depths: false` to omit the labels.
+Set machine X0 Y0 at the lower-left of a scrap area with Z0 on the copper surface. Depth groups are stacked along +Y (`line_spacing`, default 2 mm, measured start to start), shallowest at Y=0 and deepest at the top. Within a group the lines are `step_over` apart (defaults to the isolation tool's `step_over`; set `depth_test.step_over` to try a different value) and `parallel_lines` sets how many there are. The depth is also milled as a two-digit label to the right of each group, centred on it, in hundredths of a mm (`06` = 0.06 mm, `14` = 0.14 mm), cut at that group's depth. Defaults are set in the `depth_test` section of `config.yaml`; set `label_depths: false` to omit the labels.
 
 ### Using a Configuration File
 

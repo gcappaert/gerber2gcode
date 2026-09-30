@@ -84,7 +84,9 @@ depth_test:
   max_depth: 0.14         # mm - deepest line
   depth_step: 0.02        # mm - depth increase between lines
   line_length: 5.0       # mm - length of each test line (X)
-  line_spacing: 2.0       # mm - distance between lines (Y)
+  parallel_lines: 3       # lines per depth, to check overlap between adjacent passes
+  step_over: null         # mm - spacing between the parallel lines (null = isolation step_over)
+  line_spacing: 2.0       # mm - distance between depth groups (Y, start to start)
   label_depths: true      # mill the depth in hundredths of a mm (e.g. "06") beside each line
   label_height: 1.2       # mm - label character height (capped at 70% of line_spacing)
 

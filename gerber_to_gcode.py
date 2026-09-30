@@ -119,6 +119,9 @@ class GerberToGcode:
         self.depth_test_step = dt_config.get('depth_step', 0.02)
         self.depth_test_line_length = dt_config.get('line_length', 10.0)
         self.depth_test_line_spacing = dt_config.get('line_spacing', 2.0)
+        self.depth_test_parallel_lines = dt_config.get('parallel_lines', 3)
+        # None = use the isolation tool's step_over
+        self.depth_test_step_over = dt_config.get('step_over')
         self.depth_test_labels = dt_config.get('label_depths', True)
         self.depth_test_label_height = dt_config.get('label_height', 1.2)
 
@@ -1110,19 +1113,38 @@ class GerberToGcode:
                 lines.append(f"G0 Z{self.safe_height}")
         return lines
 
+    def depth_test_layout(self) -> Tuple[int, float]:
+        """Return (parallel line count, step-over in mm) for each depth group, validated."""
+        count = int(self.depth_test_parallel_lines)
+        step_over = (self.depth_test_step_over if self.depth_test_step_over is not None
+                     else self.isolation_tool.step_over)
+        if count < 1:
+            raise ValueError(f"parallel_lines must be >= 1 (got {count})")
+        if count > 1 and step_over <= 0:
+            raise ValueError(f"step_over must be > 0 (got {step_over})")
+        group_span = (count - 1) * step_over
+        if self.depth_test_line_spacing <= group_span:
+            raise ValueError(
+                f"line_spacing ({self.depth_test_line_spacing}) must be larger than the "
+                f"{count} parallel lines' span ({group_span:.3f}) or depth groups would overlap")
+        return count, step_over
+
     def generate_depth_test_gcode(self) -> str:
         """Generate a cut depth test pattern using the isolation tool.
 
-        One straight line is cut per depth, running in +X from the origin.  Lines are
-        stacked along +Y at line_spacing, shallowest at Y=0 and deepest at the top.  When
-        label_depths is on, the depth in hundredths of a mm (e.g. "06") is milled to the
-        right of each line at that line's depth so the result can be read directly.
+        Each depth gets a group of parallel lines (default 3) running in +X, spaced by the
+        step-over value, all cut at that depth, so the overlap between adjacent passes can
+        be judged at every depth.  Groups are stacked along +Y at line_spacing (start to
+        start), shallowest at Y=0 and deepest at the top.  When label_depths is on, the
+        depth in hundredths of a mm (e.g. "06") is milled to the right of each group,
+        centred on it, at that group's depth so the result can be read directly.
         """
         tool = self.isolation_tool
         depths = self.depth_test_depths()
+        n_lines, step_over = self.depth_test_layout()
         length = self.depth_test_line_length
         spacing = self.depth_test_line_spacing
-        # Keep labels clear of neighbouring lines' labels
+        # Keep labels clear of neighbouring groups' labels
         label_height = min(self.depth_test_label_height, 0.7 * spacing)
         label_x = length + 1.0
 
@@ -1132,9 +1154,10 @@ class GerberToGcode:
             f"; Tool diameter: {tool.tool_diameter} mm",
             f"; Feed rate: {tool.feed_rate} mm/min",
             f"; Depths: {depths[0]:.3f} to {depths[-1]:.3f} mm in {self.depth_test_step:.3f} mm steps "
-            f"({len(depths)} lines)",
-            f"; Each line is {length} mm long (X), lines {spacing} mm apart (Y), "
-            "shallowest at Y=0, deepest at top",
+            f"({len(depths)} depths)",
+            f"; Each depth: {n_lines} parallel line(s) {step_over} mm apart (step-over), "
+            f"{length} mm long (X)",
+            f"; Depth groups start {spacing} mm apart (Y), shallowest at Y=0, deepest at top",
             "; Labels give the depth in hundredths of a mm (06 = 0.06 mm)" if self.depth_test_labels
             else "; Depth labels disabled",
             "; Set machine origin (X0 Y0 Z0) at the lower-left corner of the test area, Z0 on the copper surface",
@@ -1149,15 +1172,18 @@ class GerberToGcode:
         ]
 
         for i, depth in enumerate(depths):
-            y = i * spacing
-            lines.append(f"; Line {i + 1}: depth {depth:.3f} mm at Y={y:.3f}")
-            lines.append(f"G0 X0 Y{y:.4f} Z{self.safe_height}")
-            lines.append(f"G1 Z{-depth:.4f} F{tool.plunge_rate}")
-            lines.append(f"G1 X{length:.4f} Y{y:.4f} F{tool.feed_rate}")
-            lines.append(f"G0 Z{self.safe_height}")
+            y0 = i * spacing
+            y_mid = y0 + (n_lines - 1) * step_over / 2
+            lines.append(f"; Depth {i + 1}: {depth:.3f} mm, {n_lines} line(s) from Y={y0:.3f}")
+            for k in range(n_lines):
+                y = y0 + k * step_over
+                lines.append(f"G0 X0 Y{y:.4f} Z{self.safe_height}")
+                lines.append(f"G1 Z{-depth:.4f} F{tool.plunge_rate}")
+                lines.append(f"G1 X{length:.4f} Y{y:.4f} F{tool.feed_rate}")
+                lines.append(f"G0 Z{self.safe_height}")
             if self.depth_test_labels:
                 lines.extend(self._depth_label_gcode(
-                    self.depth_label(depth), depth, label_x, y, label_height))
+                    self.depth_label(depth), depth, label_x, y_mid, label_height))
             lines.append("")
 
         return "\n".join(lines) + self.generate_gcode_footer()
@@ -1169,11 +1195,13 @@ class GerberToGcode:
             f.write(gcode)
 
         depths = self.depth_test_depths()
+        n_lines, step_over = self.depth_test_layout()
         print(f"Cut depth test written to {output_file}")
+        print(f"  {n_lines} parallel line(s) per depth, {step_over} mm step-over")
         for i, depth in enumerate(depths):
             label = f"  label {self.depth_label(depth)}" if self.depth_test_labels else ""
-            print(f"  Line {i + 1} (Y={i * self.depth_test_line_spacing:.2f} mm): "
-                  f"depth {depth:.3f} mm{label}")
+            print(f"  Depth {i + 1} (Y={i * self.depth_test_line_spacing:.2f} mm): "
+                  f"{depth:.3f} mm{label}")
         if self.depth_test_labels:
             labels = [self.depth_label(d) for d in depths]
             if len(set(labels)) < len(labels):
