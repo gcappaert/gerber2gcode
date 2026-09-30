@@ -73,8 +73,8 @@ tools:
 # An alignment hole is drilled at each enabled corner too, and none at disabled ones.
 # Set all four to false to skip the marks, the pause and the alignment holes.
 alignment_marks:
-  lower_left: true
-  lower_right: true
+  lower_left: false
+  lower_right: false
   upper_right: false
   upper_left: false
 
