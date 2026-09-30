@@ -139,7 +139,9 @@ alignment_marks:
   upper_left: false
 ```
 
-Corners are machine positions with the board's lower-left at X0 Y0 (on the back side, after flipping the board left-right). If all four are `false`, no marks and no pause are emitted. This only controls the milled marks: the alignment drill holes (lower-left, lower-right, upper-right) and the laser alignment mark are unchanged.
+Corners are machine positions with the board's lower-left at X0 Y0 (on the back side, after flipping the board left-right). If all four are `false`, no marks and no pause are emitted.
+
+The same setting controls the **alignment drill holes**: a hole is drilled at each enabled corner (at the start of the drill operation), and none at disabled corners. With all four `false` no alignment holes are drilled, and if there are also no PCB holes the drill operation is skipped entirely. For double-sided boards, enable corners in mirror pairs (lower-left + lower-right, or upper-left + upper-right) so each back-side mark lands over a hole drilled for the front. The laser alignment mark is separate and unchanged.
 
 ### Cut Depth Test Pattern
 
@@ -299,7 +301,7 @@ output:
 
 1. Mill isolation routes with a V-bit
 2. Drill holes
-3. Cut board outline with an end mill
+3. Cut board outline with an end mill (always the last operation in the combined file)
 
 ```bash
 python gerber_to_gcode.py -t board.gtl -e board.gm1 -d board.drl --separate

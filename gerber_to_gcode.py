@@ -429,12 +429,11 @@ class GerberToGcode:
 
         return lines
 
-    def generate_alignment_marks_block(self, board_bounds: Tuple[float, float, float, float],
-                                       tool: ToolPreset, back: bool = False) -> List[str]:
-        """Milled alignment marks at each board corner enabled in the alignment_marks
-        config section, followed by an M0 pause so the operator can inspect them.
-        Corners are in machine coordinates (lower-left = 0,0).  Returns [] if no corner
-        is enabled, in which case no pause is emitted either."""
+    def enabled_alignment_corners(self, board_bounds: Tuple[float, float, float, float]
+                                  ) -> List[Tuple[str, float, float]]:
+        """Board corners enabled in the alignment_marks config section, as
+        (label, x, y) in machine coordinates (board lower-left = 0,0).  These drive both
+        the milled marks and the alignment drill holes, so each mark has a hole."""
         x_off, y_off = self._coord_offset
         x0, y0 = board_bounds[0] + x_off, board_bounds[1] + y_off
         x1, y1 = board_bounds[2] + x_off, board_bounds[3] + y_off
@@ -444,7 +443,16 @@ class GerberToGcode:
             ('upper_right', 'upper-right', x1, y1),
             ('upper_left',  'upper-left',  x0, y1),
         ]
-        enabled = [c for c in corners if self.alignment_marks.get(c[0], False)]
+        return [(label, x, y) for key, label, x, y in corners
+                if self.alignment_marks.get(key, False)]
+
+    def generate_alignment_marks_block(self, board_bounds: Tuple[float, float, float, float],
+                                       tool: ToolPreset, back: bool = False) -> List[str]:
+        """Milled alignment marks at each board corner enabled in the alignment_marks
+        config section, followed by an M0 pause so the operator can inspect them.
+        Corners are in machine coordinates (lower-left = 0,0).  Returns [] if no corner
+        is enabled, in which case no pause is emitted either."""
+        enabled = self.enabled_alignment_corners(board_bounds)
         if not enabled:
             print("  Alignment marks: none enabled")
             return []
@@ -453,7 +461,7 @@ class GerberToGcode:
         lines = ["; === ALIGNMENT MARKS — milled before isolation, verify against drill holes ==="]
         if back:
             lines.append("; Back side: corners are machine positions after flipping the board left-right")
-        for _, label, cx, cy in enabled:
+        for label, cx, cy in enabled:
             print(f"  {side} {label} at ({cx:.2f}, {cy:.2f})")
             lines.append(f"; Mark {label} at ({cx:.3f}, {cy:.3f})")
             lines.extend(self.generate_alignment_mark_gcode(
@@ -978,11 +986,17 @@ class GerberToGcode:
                             board_bounds: Tuple[float, float, float, float] = None) -> List[str]:
         """Generate G-code for drilling holes.
 
-        If board_bounds is provided, three alignment holes are drilled first at the board
-        corners (0,0), (W,0), and (W,H) so the board can be precisely re-homed when
-        flipped for back-side milling.
+        If board_bounds is provided, an alignment hole is drilled first at each board
+        corner enabled in the alignment_marks config section, so the board can be
+        precisely re-homed when flipped for back-side milling.  With no corner enabled
+        and no PCB holes there is nothing to drill and [] is returned.
         """
         tool = self.drill_tool
+        alignment_corners = (self.enabled_alignment_corners(board_bounds)
+                             if board_bounds is not None else [])
+        if not holes and not alignment_corners:
+            return []
+
         gcode_lines = [
             "; Drilling",
             f"; Total depth: {tool.total_depth} mm",
@@ -1003,21 +1017,12 @@ class GerberToGcode:
                 cmds.append(f"G0 Z{self.safe_height}")
             return cmds
 
-        # Alignment holes at board corners — drilled before PCB holes so the user
-        # can immediately verify position.  Three non-collinear corners fully constrain
-        # translation AND rotation; (0,0), (W,0), and (W,H) form an L along the bottom
-        # and right edge, matching the flip workflow.
-        if board_bounds is not None:
-            x_off, y_off = self._coord_offset
-            corners = [
-                (board_bounds[0] + x_off, board_bounds[1] + y_off),  # (0, 0)  lower-left
-                (board_bounds[2] + x_off, board_bounds[1] + y_off),  # (W, 0)  lower-right
-                (board_bounds[2] + x_off, board_bounds[3] + y_off),  # (W, H)  upper-right
-            ]
-            labels = ["(0,0) lower-left", "(W,0) lower-right", "(W,H) upper-right"]
+        # Alignment holes at the enabled board corners — drilled before PCB holes so the
+        # user can immediately verify position.  One per enabled alignment mark.
+        if alignment_corners:
             gcode_lines.append("; === ALIGNMENT HOLES — drill before flipping, used for front/back registration ===")
-            for (ax, ay), lbl in zip(corners, labels):
-                gcode_lines.append(f"; Alignment hole {lbl}")
+            for label, ax, ay in alignment_corners:
+                gcode_lines.append(f"; Alignment hole {label} ({ax:.3f}, {ay:.3f})")
                 gcode_lines.extend(_drill_at(ax, ay))
             gcode_lines.append("; === END ALIGNMENT HOLES ===")
             gcode_lines.append("")
@@ -1239,12 +1244,7 @@ class GerberToGcode:
                 trace_bitmap, trace_gerber_bounds, board_bounds)
             operations.append('isolation')
 
-        # Add edge cuts to operations if we have an outline
-        if self.board_outline:
-            gcode_sections['edge_cuts'] = self.process_edge_cuts(self.board_outline)
-            operations.append('edge_cuts')
-
-        # Process drill file (alignment holes are added even if no PCB holes)
+        # Process drill file (alignment holes for enabled marks are added even if no PCB holes)
         holes = []
         if drill_file and os.path.exists(drill_file):
             print(f"\n=== Processing drill file: {drill_file} ===")
@@ -1254,6 +1254,12 @@ class GerberToGcode:
             if drill_lines:
                 gcode_sections['drill'] = drill_lines
                 operations.append('drill')
+
+        # Edge cuts come last so the board stays held in place until everything else is
+        # done (the combined file runs operations in this order).
+        if self.board_outline:
+            gcode_sections['edge_cuts'] = self.process_edge_cuts(self.board_outline)
+            operations.append('edge_cuts')
 
         # Process laser etching layer (always written to separate files)
         if laser_layer and os.path.exists(laser_layer):

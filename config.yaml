@@ -70,7 +70,8 @@ tools:
 # Milled alignment marks (X in a circle) on the isolation passes, front and back.
 # Enable/disable per board corner; corners are machine positions (lower-left = X0 Y0).
 # A pause (M0) follows the marks so you can check them against the drill holes.
-# Set all four to false to skip the marks and the pause.
+# An alignment hole is drilled at each enabled corner too, and none at disabled ones.
+# Set all four to false to skip the marks, the pause and the alignment holes.
 alignment_marks:
   lower_left: true
   lower_right: true
