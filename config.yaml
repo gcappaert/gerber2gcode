@@ -72,8 +72,10 @@ depth_test:
   min_depth: 0.06         # mm - shallowest line
   max_depth: 0.14         # mm - deepest line
   depth_step: 0.02        # mm - depth increase between lines
-  line_length: 10.0       # mm - length of each test line (X)
+  line_length: 5.0       # mm - length of each test line (X)
   line_spacing: 2.0       # mm - distance between lines (Y)
+  label_depths: true      # mill the depth in hundredths of a mm (e.g. "06") beside each line
+  label_height: 1.2       # mm - label character height (capped at 70% of line_spacing)
 
 # Soldermask overlay for photoemulsion printing
 # Used with --soldermask-png to generate a printable transparency for soldermask application

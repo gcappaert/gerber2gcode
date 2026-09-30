@@ -123,7 +123,7 @@ python gerber_to_gcode.py --depth-test
 python gerber_to_gcode.py --depth-test test.nc --depth-min 0.04 --depth-max 0.10 --depth-step 0.01
 ```
 
-Set machine X0 Y0 at the lower-left of a scrap area with Z0 on the copper surface. Lines are stacked along +Y (`line_spacing`, default 2 mm), shallowest at Y=0 and deepest at the top. Defaults are set in the `depth_test` section of `config.yaml`.
+Set machine X0 Y0 at the lower-left of a scrap area with Z0 on the copper surface. Lines are stacked along +Y (`line_spacing`, default 2 mm), shallowest at Y=0 and deepest at the top. The depth is also milled as a two-digit label to the right of each line, in hundredths of a mm (`06` = 0.06 mm, `14` = 0.14 mm), cut at that line's depth. Defaults are set in the `depth_test` section of `config.yaml`; set `label_depths: false` to omit the labels.
 
 ### Using a Configuration File
 
