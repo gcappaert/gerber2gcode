@@ -67,6 +67,16 @@ tools:
     pad_power: 400          # S value for pad ablation (omit to use main power)
     pad_feed_rate: 500      # mm/min for pad ablation (omit to use main feed_rate)
 
+# Milled alignment marks (X in a circle) on the isolation passes, front and back.
+# Enable/disable per board corner; corners are machine positions (lower-left = X0 Y0).
+# A pause (M0) follows the marks so you can check them against the drill holes.
+# Set all four to false to skip the marks and the pause.
+alignment_marks:
+  lower_left: true
+  lower_right: true
+  upper_right: false
+  upper_left: false
+
 # Cut depth test pattern (--depth-test), cut with the isolation tool settings above
 depth_test:
   min_depth: 0.06         # mm - shallowest line

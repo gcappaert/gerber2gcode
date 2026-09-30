@@ -5,6 +5,7 @@ A command-line tool for converting Gerber PCB layout files to GRBL-compatible G-
 ## Features
 
 - Converts standard Gerber files to G-code for CNC milling
+- **File picker window**: choose Gerber/drill files from File Explorer instead of typing names
 - **Laser etching** support for solder mask removal (diode laser, GRBL `$32=1`)
 - **Double-sided PCB** support via back copper isolation with automatic horizontal mirror
 - **Solder mask overlay PNG** generation for photoemulsion stencil printing
@@ -60,6 +61,21 @@ To add to PATH:
 4. Add: `C:\Users\gcapp\Documents\Making\PCB Milling\Gerber2Gcode`
 5. Click OK and open a new command prompt
 
+### File Picker Window (no typing filenames)
+
+Run the tool with no input files, or pass `--gui`, to open a window:
+
+```batch
+gerber2gcode.bat          # or: python gerber_to_gcode.py --gui
+```
+
+- **Select Gerber files…** opens a normal file dialog where you can multi-select everything from your fab output at once. Files are assigned automatically by name: `.gtl`/`F_Cu` → top copper, `.gbl`/`B_Cu` → back copper, `.gm1`/`.gko`/`Edge_Cuts` → edge cuts, `.drl`/`.xln` → drill (plated holes preferred over `NPTH`), `.gts`/`F_Mask` → solder mask.
+- **Browse…** beside each field picks or replaces a single file; **✕** clears it. The laser copper layer is never guessed, so pick it with Browse if you use the laser workflow.
+- Output goes to the **Output folder** (defaults to the folder of the files you picked), using the **Output file** name, or one file per operation with the checkbox ticked.
+- Settings still come from `config.yaml`. The log box shows the same messages as the command line.
+
+The command-line options below still work exactly as before.
+
 ### Basic Usage
 
 ```bash
@@ -111,6 +127,20 @@ python gerber_to_gcode.py -t front.gtl -b back.gbl -e edges.gm1 --separate
 
 The back copper bitmap is horizontally mirrored to compensate for physically flipping the board.
 
+### Alignment Marks
+
+The front and back isolation files mill an alignment mark (X in a circle) at each enabled board corner, then pause (`M0`) so you can check the marks against the drilled alignment holes. Choose the corners in the `alignment_marks` section of `config.yaml`:
+
+```yaml
+alignment_marks:
+  lower_left: true     # default on
+  lower_right: true    # default on
+  upper_right: false
+  upper_left: false
+```
+
+Corners are machine positions with the board's lower-left at X0 Y0 (on the back side, after flipping the board left-right). If all four are `false`, no marks and no pause are emitted. This only controls the milled marks: the alignment drill holes (lower-left, lower-right, upper-right) and the laser alignment mark are unchanged.
+
 ### Cut Depth Test Pattern
 
 Generates a set of straight test lines at increasing depths (default 0.06–0.14 mm in 0.02 mm steps), cut with the isolation tool settings. Use it to find the depth that cleanly isolates copper on your board.
@@ -148,6 +178,7 @@ python gerber_to_gcode.py -t traces.gtl --config my_settings.yaml
 | `-m, --mask-layer` | Solder mask Gerber for accurate pad fill (.gts top, .gbs bottom) |
 | `-b, --back-traces` | Back copper Gerber for double-sided / ground plane isolation (.gbl, .gbr) |
 | `input` | Legacy: Input Gerber file (use `-t` instead) |
+| `--gui` | Open the file-picker window (also opens when no input files are given) |
 
 ### Output Options
 
@@ -239,6 +270,13 @@ tools:
     pad_max_eccentricity: 0.8  # 0=circle 1=line; below this = pad
     pad_power: 400          # S value for pad ablation (omit to use main power)
     pad_feed_rate: 500      # mm/min for pad ablation (omit to use main feed_rate)
+
+# Milled alignment marks on the isolation passes - enable per board corner
+alignment_marks:
+  lower_left: true
+  lower_right: true
+  upper_right: false
+  upper_left: false
 
 # Soldermask overlay settings (for photoemulsion printing)
 soldermask_overlay:

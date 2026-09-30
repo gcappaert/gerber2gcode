@@ -8,6 +8,7 @@ Supports separate tools for isolation routing, edge cuts, and drilling
 import argparse
 import sys
 import os
+import threading
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import re
@@ -107,6 +108,10 @@ class GerberToGcode:
         self.soldermask_print_dpi = sm_config.get('print_dpi', 600)
         self.soldermask_invert = sm_config.get('invert', True)
 
+        # Milled alignment marks: which board corners get a mark
+        self.alignment_marks = {k: bool(v) for k, v in
+                                self.config.get('alignment_marks', {}).items()}
+
         # Cut depth test pattern settings
         dt_config = self.config.get('depth_test', {})
         self.depth_test_min = dt_config.get('min_depth', 0.06)
@@ -150,6 +155,10 @@ class GerberToGcode:
                     'feed_rate': 100, 'plunge_rate': 60, 'cut_depth': 0.5,
                     'total_depth': 1.8, 'retract_height': 1.0
                 }
+            },
+            'alignment_marks': {
+                'lower_left': True, 'lower_right': True,
+                'upper_right': False, 'upper_left': False
             },
             'edge_margin': 1.0,
             'output': {'separate_files': False, 'file_prefix': 'pcb'}
@@ -420,6 +429,45 @@ class GerberToGcode:
 
         return lines
 
+    def generate_alignment_marks_block(self, board_bounds: Tuple[float, float, float, float],
+                                       tool: ToolPreset, back: bool = False) -> List[str]:
+        """Milled alignment marks at each board corner enabled in the alignment_marks
+        config section, followed by an M0 pause so the operator can inspect them.
+        Corners are in machine coordinates (lower-left = 0,0).  Returns [] if no corner
+        is enabled, in which case no pause is emitted either."""
+        x_off, y_off = self._coord_offset
+        x0, y0 = board_bounds[0] + x_off, board_bounds[1] + y_off
+        x1, y1 = board_bounds[2] + x_off, board_bounds[3] + y_off
+        corners = [
+            ('lower_left',  'lower-left',  x0, y0),
+            ('lower_right', 'lower-right', x1, y0),
+            ('upper_right', 'upper-right', x1, y1),
+            ('upper_left',  'upper-left',  x0, y1),
+        ]
+        enabled = [c for c in corners if self.alignment_marks.get(c[0], False)]
+        if not enabled:
+            print("  Alignment marks: none enabled")
+            return []
+
+        side = "Back alignment mark" if back else "Alignment mark"
+        lines = ["; === ALIGNMENT MARKS — milled before isolation, verify against drill holes ==="]
+        if back:
+            lines.append("; Back side: corners are machine positions after flipping the board left-right")
+        for _, label, cx, cy in enabled:
+            print(f"  {side} {label} at ({cx:.2f}, {cy:.2f})")
+            lines.append(f"; Mark {label} at ({cx:.3f}, {cy:.3f})")
+            lines.extend(self.generate_alignment_mark_gcode(
+                cx, cy, tool, tool.cut_depth, laser=False, with_drill_hole=False))
+            lines.append("")
+        lines.append("; === PAUSE — inspect alignment marks vs drill holes, then resume ===")
+        lines.append(f"G0 Z{self.safe_height}    ; Raise to safe height")
+        lines.append("M5          ; Stop spindle")
+        lines.append("M0          ; ** INSPECT: marks should be centred on drill holes — resume to mill traces **")
+        lines.append(f"M3 S{tool.spindle_speed}  ; Restart spindle")
+        lines.append("G4 P2       ; Dwell for spindle")
+        lines.append("")
+        return lines
+
     def generate_soldermask_png(self, mask_file: str, output_path: str):
         """Render solder mask Gerber to a printable PNG sized for physical printing.
 
@@ -502,31 +550,8 @@ class GerberToGcode:
         # After flipping the board left-right, set machine origin at the (W,0) drill hole
         # (now the lower-left).  The marks below should then land on the two bottom holes.
         if board_bounds is not None:
-            x_off, y_off = self._coord_offset
-            mark_a_x = board_bounds[0] + x_off   # = 0.0  (lower-left after flip = old lower-right hole)
-            mark_a_y = board_bounds[1] + y_off   # = 0.0
-            mark_b_x = board_bounds[2] + x_off   # = board_width (lower-right after flip = old lower-left hole)
-            mark_b_y = mark_a_y
-            print(f"  Back alignment mark A at ({mark_a_x:.2f}, {mark_a_y:.2f})")
-            print(f"  Back alignment mark B at ({mark_b_x:.2f}, {mark_b_y:.2f})")
-            lines.append("; === ALIGNMENT MARKS — milled before isolation, verify against drill holes ===")
-            lines.append(f"; Mark A at ({mark_a_x:.3f}, {mark_a_y:.3f}) — lower-left (old lower-right drill hole)")
-            lines.extend(self.generate_alignment_mark_gcode(
-                mark_a_x, mark_a_y, self.back_isolation_tool,
-                self.back_isolation_tool.cut_depth, laser=False, with_drill_hole=False))
-            lines.append("")
-            lines.append(f"; Mark B at ({mark_b_x:.3f}, {mark_b_y:.3f}) — lower-right (old lower-left drill hole)")
-            lines.extend(self.generate_alignment_mark_gcode(
-                mark_b_x, mark_b_y, self.back_isolation_tool,
-                self.back_isolation_tool.cut_depth, laser=False, with_drill_hole=False))
-            lines.append("")
-            lines.append("; === PAUSE — inspect alignment marks vs drill holes, then resume ===")
-            lines.append(f"G0 Z{self.safe_height}    ; Raise to safe height")
-            lines.append("M5          ; Stop spindle")
-            lines.append("M0          ; ** INSPECT: marks should be centred on drill holes — resume to mill traces **")
-            lines.append(f"M3 S{self.back_isolation_tool.spindle_speed}  ; Restart spindle")
-            lines.append("G4 P2       ; Dwell for spindle")
-            lines.append("")
+            lines.extend(self.generate_alignment_marks_block(
+                board_bounds, self.back_isolation_tool, back=True))
 
         # Generate isolation toolpaths using back isolation tool settings.
         saved_tool = self.isolation_tool
@@ -559,29 +584,7 @@ class GerberToGcode:
         # The operator checks that the milled marks land on the drilled alignment holes;
         # if they do, the board is correctly registered and milling can proceed.
         if add_alignment_mark and board_bounds is not None:
-            x_off, y_off = self._coord_offset
-            mark_a_x = board_bounds[0] + x_off   # = 0.0
-            mark_a_y = board_bounds[1] + y_off   # = 0.0
-            mark_b_x = board_bounds[2] + x_off   # = board_width
-            mark_b_y = mark_a_y
-            print(f"  Alignment mark A at ({mark_a_x:.2f}, {mark_a_y:.2f})  [lower-left]")
-            print(f"  Alignment mark B at ({mark_b_x:.2f}, {mark_b_y:.2f})  [lower-right, {mark_b_x - mark_a_x:.2f} mm]")
-            gcode_lines.append("; === ALIGNMENT MARKS — milled before isolation, centres match drill holes ===")
-            gcode_lines.append(f"; Mark A at ({mark_a_x:.3f}, {mark_a_y:.3f}) — lower-left drill hole")
-            gcode_lines.extend(self.generate_alignment_mark_gcode(
-                mark_a_x, mark_a_y, tool, tool.cut_depth, laser=False, with_drill_hole=False))
-            gcode_lines.append("")
-            gcode_lines.append(f"; Mark B at ({mark_b_x:.3f}, {mark_b_y:.3f}) — lower-right drill hole")
-            gcode_lines.extend(self.generate_alignment_mark_gcode(
-                mark_b_x, mark_b_y, tool, tool.cut_depth, laser=False, with_drill_hole=False))
-            gcode_lines.append("")
-            gcode_lines.append("; === PAUSE — inspect alignment marks vs drill holes, then resume ===")
-            gcode_lines.append(f"G0 Z{self.safe_height}    ; Raise to safe height")
-            gcode_lines.append("M5          ; Stop spindle")
-            gcode_lines.append("M0          ; ** INSPECT: marks should be centred on drill holes — resume to mill traces **")
-            gcode_lines.append(f"M3 S{tool.spindle_speed}  ; Restart spindle")
-            gcode_lines.append("G4 P2       ; Dwell for spindle")
-            gcode_lines.append("")
+            gcode_lines.extend(self.generate_alignment_marks_block(board_bounds, tool))
 
         # Pad bitmap to board bounds so traces at the edges of the copper region
         # get fully closed contours and coordinates align with edge cuts / drill layers.
@@ -1361,12 +1364,230 @@ class GerberToGcode:
         print(f"Operations: {', '.join(operations)}")
 
 
+def classify_gerber_files(paths: List[str]) -> Dict[str, str]:
+    """Guess which converter input each file is from its name/extension.
+    Understands Protel-style extensions (.gtl, .gbl, .gts, .gm1 ...) and KiCad-style
+    names (F_Cu, B_Cu, F_Mask, Edge_Cuts).  Returns {field: path}; unrecognised files
+    are skipped.  The laser layer is never guessed (it reuses the top copper file)."""
+    found: Dict[str, str] = {}
+    for path in paths:
+        name = os.path.basename(path).lower()
+        ext = os.path.splitext(name)[1]
+        if ext in ('.drl', '.xln', '.exc'):
+            # Prefer plated holes over non-plated when a fab set has both
+            if 'drill' not in found or ('npth' in os.path.basename(found['drill']).lower()
+                                        and 'npth' not in name):
+                found['drill'] = path
+        elif 'edge_cuts' in name or 'edge.cuts' in name or ext in ('.gm1', '.gko', '.gml', '.gm'):
+            found['edge_cuts'] = path
+        elif 'f_cu' in name or ext == '.gtl':
+            found['traces'] = path
+        elif 'b_cu' in name or ext == '.gbl':
+            found['back_traces'] = path
+        elif 'f_mask' in name or ext == '.gts':
+            found['mask_layer'] = path
+    return found
+
+
+class GerberGui:
+    """Small tkinter front end: pick the Gerber/drill files from a file dialog
+    instead of typing their names, then run the same conversion as the CLI."""
+
+    FIELDS = [
+        ('traces', 'Top copper (traces)'),
+        ('back_traces', 'Back copper'),
+        ('edge_cuts', 'Edge cuts'),
+        ('drill', 'Drill file'),
+        ('laser_layer', 'Laser copper layer'),
+        ('mask_layer', 'Solder mask'),
+    ]
+    FILETYPES = [
+        ('Gerber / drill files',
+         '*.gbr *.ger *.gtl *.gbl *.gts *.gbs *.gm1 *.gko *.gml *.drl *.xln *.exc'),
+        ('All files', '*.*'),
+    ]
+
+    def __init__(self, config_file: Optional[str]):
+        import tkinter as tk
+        from tkinter import ttk
+        import queue
+
+        self.config_file = config_file
+        self.queue = queue.Queue()
+        self.last_dir = os.getcwd()
+
+        self.root = tk.Tk()
+        self.root.title("Gerber to G-code")
+        frame = ttk.Frame(self.root, padding=12)
+        frame.grid(sticky='nsew')
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(99, weight=1)
+
+        ttk.Button(frame, text="Select Gerber files…  (auto-assigns by name)",
+                   command=self.select_many).grid(row=0, column=0, columnspan=4,
+                                                  sticky='ew', pady=(0, 8))
+
+        self.vars = {}
+        for row, (key, label) in enumerate(self.FIELDS, start=1):
+            var = tk.StringVar()
+            self.vars[key] = var
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', pady=2)
+            ttk.Entry(frame, textvariable=var, width=60).grid(row=row, column=1, sticky='ew', padx=6)
+            ttk.Button(frame, text="Browse…",
+                       command=lambda k=key: self.browse_one(k)).grid(row=row, column=2)
+            ttk.Button(frame, text="✕", width=3,
+                       command=lambda v=var: v.set('')).grid(row=row, column=3, padx=(4, 0))
+
+        row = len(self.FIELDS) + 1
+        self.out_dir = tk.StringVar()
+        self.out_file = tk.StringVar(value='output.nc')
+        self.separate = tk.BooleanVar(value=False)
+        ttk.Label(frame, text="Output folder").grid(row=row, column=0, sticky='w', pady=(10, 2))
+        ttk.Entry(frame, textvariable=self.out_dir).grid(row=row, column=1, sticky='ew', padx=6,
+                                                         pady=(10, 2))
+        ttk.Button(frame, text="Browse…", command=self.browse_out_dir).grid(row=row, column=2,
+                                                                          pady=(10, 2))
+        ttk.Label(frame, text="Output file").grid(row=row + 1, column=0, sticky='w', pady=2)
+        ttk.Entry(frame, textvariable=self.out_file).grid(row=row + 1, column=1, sticky='ew', padx=6)
+        ttk.Checkbutton(frame, text="One file per operation (--separate)",
+                        variable=self.separate).grid(row=row + 2, column=1, sticky='w', pady=2)
+
+        self.run_button = ttk.Button(frame, text="Generate G-code", command=self.generate)
+        self.run_button.grid(row=row + 3, column=0, columnspan=4, sticky='ew', pady=8)
+
+        self.log = tk.Text(frame, height=12, width=80, state='disabled', wrap='word')
+        self.log.grid(row=99, column=0, columnspan=4, sticky='nsew')
+
+    # --- file selection -------------------------------------------------------
+    def _remember(self, path: str):
+        self.last_dir = os.path.dirname(path) or self.last_dir
+        if not self.out_dir.get():
+            self.out_dir.set(self.last_dir)
+
+    def browse_one(self, key: str):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(initialdir=self.last_dir, filetypes=self.FILETYPES)
+        if path:
+            self.vars[key].set(path)
+            self._remember(path)
+
+    def select_many(self):
+        from tkinter import filedialog
+        paths = filedialog.askopenfilenames(initialdir=self.last_dir, filetypes=self.FILETYPES)
+        if paths:
+            self.assign_files(list(paths))
+
+    def assign_files(self, paths: List[str]):
+        found = classify_gerber_files(paths)
+        for key, path in found.items():
+            self.vars[key].set(path)
+        self._remember(paths[0])
+        skipped = [os.path.basename(p) for p in paths if p not in found.values()]
+        if skipped:
+            self._log(f"Not assigned (unrecognised or duplicate): {', '.join(skipped)}\n")
+
+    def browse_out_dir(self):
+        from tkinter import filedialog
+        path = filedialog.askdirectory(initialdir=self.out_dir.get() or self.last_dir)
+        if path:
+            self.out_dir.set(path)
+
+    # --- running --------------------------------------------------------------
+    def _log(self, text: str):
+        self.log.config(state='normal')
+        self.log.insert('end', text)
+        self.log.see('end')
+        self.log.config(state='disabled')
+
+    def _poll(self):
+        import queue
+        try:
+            while True:
+                item = self.queue.get_nowait()
+                if item is None:
+                    self.run_button.config(state='normal')
+                    return
+                self._log(item)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll)
+
+    def generate(self):
+        from tkinter import messagebox
+        inputs = {k: v.get().strip() or None for k, v in self.vars.items()}
+        if not any(inputs.values()):
+            messagebox.showerror("Gerber to G-code", "Select at least one input file.")
+            return
+        out_dir = self.out_dir.get().strip() or self.last_dir
+        out_file = self.out_file.get().strip() or 'output.nc'
+        separate = self.separate.get()
+
+        self.run_button.config(state='disabled')
+        self.log.config(state='normal')
+        self.log.delete('1.0', 'end')
+        self.log.config(state='disabled')
+        threading.Thread(target=self._work, args=(inputs, out_dir, out_file, separate),
+                         daemon=True).start()
+        self._poll()
+
+    def _work(self, inputs, out_dir, out_file, separate):
+        import contextlib
+        import traceback
+
+        class _QueueWriter:
+            def __init__(self, q): self.q = q
+            def write(self, s): self.q.put(s)
+            def flush(self): pass
+
+        original_dir = os.getcwd()
+        try:
+            with contextlib.redirect_stdout(_QueueWriter(self.queue)):
+                # Config is loaded at construction, before changing directory, so a
+                # relative config path still resolves.  Output files are written to
+                # the current directory, hence the chdir.
+                converter = GerberToGcode(self.config_file)
+                converter.separate_files = separate
+                os.makedirs(out_dir, exist_ok=True)
+                os.chdir(out_dir)
+                converter.convert(
+                    traces_file=inputs['traces'], edge_cuts_file=inputs['edge_cuts'],
+                    drill_file=inputs['drill'], output_file=out_file,
+                    laser_layer=inputs['laser_layer'], mask_layer=inputs['mask_layer'],
+                    back_traces_file=inputs['back_traces'])
+            self.queue.put(f"\nDone. Files written to: {out_dir}\n")
+        except SystemExit:
+            self.queue.put("\nFailed — see messages above.\n")
+        except Exception:
+            self.queue.put(traceback.format_exc())
+        finally:
+            os.chdir(original_dir)
+            self.queue.put(None)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def run_gui(config_file: Optional[str]):
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        print("Error: tkinter not available, so the file picker cannot open. "
+              "Pass file names on the command line instead (see --help).")
+        sys.exit(1)
+    GerberGui(config_file).run()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Convert Gerber files to GRBL G-code for PCB milling',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Pick the files from a window instead of typing them (also the default with no inputs)
+  %(prog)s --gui
+
   # Basic isolation routing
   %(prog)s -t traces.gbr -o output.nc
 
@@ -1417,6 +1638,9 @@ Examples:
     parser.add_argument('--generate-edge-cuts', type=str,
                         help='Output file for generated edge cuts Gerber')
 
+    parser.add_argument('--gui', action='store_true',
+                        help='Open the file-picker window (also opens when no input files are given)')
+
     # Cut depth test pattern
     parser.add_argument('--depth-test', nargs='?', const='depth_test.nc', metavar='FILE',
                         help='Generate a cut depth test pattern instead of converting Gerbers '
@@ -1462,10 +1686,11 @@ Examples:
 
     # Handle legacy positional argument
     traces_file = args.traces or args.input
-    if not traces_file and not args.edge_cuts and not args.drill and not args.laser_layer and not args.mask_layer and not args.back_traces:
-        parser.print_help()
-        print("\nError: At least one input file is required (-t, -e, or -d)")
-        sys.exit(1)
+    no_inputs = (not traces_file and not args.edge_cuts and not args.drill
+                 and not args.laser_layer and not args.mask_layer and not args.back_traces)
+    if args.gui or no_inputs:
+        run_gui(args.config)
+        return
 
     # Create converter
     converter = GerberToGcode(args.config)
