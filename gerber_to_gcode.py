@@ -830,23 +830,41 @@ class GerberToGcode:
                                    ) -> List[Tuple[float, float]]:
         """Parse edge cuts bitmap and return board outline in absolute Gerber coordinates."""
         from skimage import measure
+        from scipy import ndimage
 
         val_min, val_max = bitmap.min(), bitmap.max()
         threshold = val_min + (val_max - val_min) * 0.4
         binary = bitmap > threshold
 
+        # The outline is drawn as a line only 1-2 px wide, and KiCad sets the Gerber bounds
+        # right on its outer edge, so the ring hugs the image border and its rounded
+        # corners break into disconnected dots.  Tracing the line's contours then yields
+        # fragments (the longest being one side of the board).  Filling the ring's
+        # interior gives a solid shape with a single clean outer contour instead.  If the
+        # outline is not a closed ring, nothing is enclosed and the raw line is traced.
+        binary = ndimage.binary_fill_holes(binary)
+
+        pad_size = 2
+        binary = np.pad(binary, pad_size, mode='constant', constant_values=False)
         contours = measure.find_contours(binary.astype(float), 0.5)
+        contours = [contour - pad_size for contour in contours]
 
         if not contours:
             return []
 
         largest_contour = max(contours, key=len)
         smoothed = self.smooth_path(largest_contour, tolerance=1.0)
-        scale_factor = 25.4 / self.dpi
         gb_min_x, gb_min_y, gb_max_x, gb_max_y = gerber_bounds
 
-        outline = [(point[1] * scale_factor + gb_min_x,
-                    gb_max_y - point[0] * scale_factor)
+        # Derive pixel size from the bitmap itself (pixel 0 at gb_min, pixel W-1 at gb_max),
+        # as bitmap_to_toolpaths does.  25.4/dpi is wrong because the renderer uses
+        # int(dpi/25.4) pixels per mm, which shifts the outline by ~0.5 mm over a board.
+        W, H = bitmap.shape[1], bitmap.shape[0]
+        scale_x = (gb_max_x - gb_min_x) / (W - 1) if W > 1 else (25.4 / self.dpi)
+        scale_y = (gb_max_y - gb_min_y) / (H - 1) if H > 1 else (25.4 / self.dpi)
+
+        outline = [(point[1] * scale_x + gb_min_x,
+                    gb_max_y - point[0] * scale_y)
                    for point in smoothed]
 
         return outline
